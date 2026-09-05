@@ -1,6 +1,6 @@
 [package]
 name = "rugo-resp"
-description = "placeholder"
+description = "RESP2 and RESP3, parsed in place with no allocation on the hot path."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

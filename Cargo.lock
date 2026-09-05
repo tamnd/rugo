@@ -484,6 +484,9 @@ dependencies = [
 [[package]]
 name = "rugo-net"
 version = "0.1.0"
+dependencies = [
+ "libc",
+]
 
 [[package]]
 name = "rugo-resp"

@@ -1,6 +1,6 @@
 [package]
 name = "rugo-net"
-description = "placeholder"
+description = "Readiness notification over epoll and kqueue, for rugo's event loop."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -11,6 +11,9 @@ readme.workspace = true
 keywords.workspace = true
 categories.workspace = true
 publish.workspace = true
+
+[dependencies]
+libc.workspace = true
 
 [lints]
 workspace = true

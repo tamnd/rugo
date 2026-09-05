@@ -1,0 +1,43 @@
+version: 2
+
+updates:
+  # Grouped, because several separate pull requests that each bump one patch version is not review, it is clicking.
+  # One pull request a week that says what moved is.
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    groups:
+      patch:
+        update-types: [patch]
+      minor:
+        update-types: [minor]
+
+  # The fuzz targets are their own workspace with their own lock file, so nothing above sees them.
+  # They are also where a stale libfuzzer-sys shows up as a link error rather than as a version number, which is the least readable way to be told about it.
+  - package-ecosystem: cargo
+    directory: /fuzz
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 2
+    groups:
+      fuzz:
+        patterns: ["*"]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    groups:
+      actions:
+        patterns: ["*"]
+    # dtolnay/rust-toolchain tags itself with the Rust version it installs, so the msrv job pins it to the compiler floor rather than to a version of the action.
+    # Dependabot cannot know that and bumps it to the highest tag, which produces a job asking rustup for a Rust that does not exist and a 404.
+    # The floor moves when we decide it moves, and it moves in rust-toolchain.toml and in Cargo.toml at the same time.
+    ignore:
+      - dependency-name: dtolnay/rust-toolchain

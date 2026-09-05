@@ -1,0 +1,238 @@
+name: release
+
+# A tag is what a release is cut from, and nothing here produces one from an untagged tree.
+#
+# The manual trigger is the recovery path.
+# A tag push runs the copy of this file that is in the tag, so a fix landed on main after a tag was cut does not apply to that tag and the tag cannot be moved to pick it up.
+# Dispatching this from main with a tag input is how a half finished release gets finished, using main's workflow against the tag's code.
+# The ref on every checkout below is the half that makes it the tag's code.
+#
+# Two things come out of a tag.
+# A binary per platform attached to a GitHub release, which is what somebody who wants to run a cache server wants, and the seven crates on crates.io, which is what makes `cargo install rugo` work and lets the map be used on its own by anybody who wants a shared cache inside their own process.
+# The crates go last, because a GitHub release can be deleted and a version on crates.io cannot.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: The tag to build the release from
+        required: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUSTFLAGS: -D warnings
+
+permissions:
+  contents: read
+
+# Two tags pushed close together would otherwise race through the same release.
+# Not cancelled, because cancelling halfway through leaves a release with some of its binaries attached, which is worse than waiting.
+concurrency:
+  group: release-${{ inputs.tag || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # The tag, the version in Cargo.toml and the changelog have to agree before anything else runs.
+  # All three drift, and finding out after the release is published means the fix is another release.
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - id: v
+        run: |
+          tag="${{ inputs.tag || github.ref_name }}"
+          version="${tag#v}"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          manifest=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
+          if [ "$manifest" != "$version" ]; then
+            echo "tag $tag says $version, Cargo.toml says $manifest" >&2
+            exit 1
+          fi
+          if ! grep -q "^## $version " CHANGELOG.md; then
+            echo "CHANGELOG.md has no section for $version" >&2
+            exit 1
+          fi
+          # The crates depend on each other by version as well as by path, and those versions are what a published crate resolves against.
+          # One of them left behind means a release that builds here and does not build for anybody who installs it.
+          stale=$(awk '/^\[workspace.dependencies\]/ { on = 1; next } on && /^\[/ { exit } on' Cargo.toml \
+            | grep -o 'version = "[^"]*"' | grep -v "\"$version\"" || true)
+          if [ -n "$stale" ]; then
+            echo "workspace dependencies still ask for $stale, and this release is $version" >&2
+            exit 1
+          fi
+      # A release that claims a ratio it cannot show is the one failure this project cannot recover from.
+      # The scoreboard is generated from the sweep files committed beside it, so this is the check that the numbers in the tag are the numbers the data produces.
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo xtask check
+
+  # The same gates the branch runs, against the tag rather than against a branch tip that has since moved.
+  verify:
+    needs: check
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2.9.2
+        with:
+          save-if: false
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets --all-features
+      - run: cargo test --workspace --locked
+      - run: cargo test --workspace --locked --release
+
+  # One binary per platform anyone actually runs a cache server on, plus the two anyone develops on.
+  # The linux-arm64 entry is a native runner rather than a cross build: this server has a NEON probe path that no other target compiles, and a cross built binary from an x86 host is a binary whose hot loop nobody has run.
+  build:
+    needs: [check, verify]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2.9.2
+        with:
+          save-if: false
+      - run: cargo build --release --locked -p rugo --target ${{ matrix.target }}
+      - name: Package
+        shell: bash
+        run: |
+          v="${{ needs.check.outputs.version }}"
+          name="rugo-$v-${{ matrix.target }}"
+          mkdir -p "dist/$name"
+          if [ -f "target/${{ matrix.target }}/release/rugo.exe" ]; then
+            cp "target/${{ matrix.target }}/release/rugo.exe" "dist/$name/"
+          else
+            cp "target/${{ matrix.target }}/release/rugo" "dist/$name/"
+          fi
+          # SCOREBOARD.md travels with the binary, because the claim and the thing the claim is about should not be one click apart.
+          cp README.md LICENSE-APACHE SCOREBOARD.md "dist/$name/"
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+          # Written next to the archive rather than only in the release notes, so a copy that was fetched once and passed around can still be checked.
+          # The three runners do not agree on which tool exists. Linux and the Git Bash that Windows runs this step under have sha256sum, macOS has shasum and not sha256sum.
+          cd dist
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
+          else
+            shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
+          fi
+      - uses: actions/upload-artifact@v7.0.1
+        with:
+          name: ${{ matrix.target }}
+          path: dist/*.tar.gz*
+          if-no-files-found: error
+
+  publish:
+    needs: [check, verify, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - uses: actions/download-artifact@v8.0.1
+        with:
+          path: dist
+          merge-multiple: true
+      # The release body is the changelog section, not a generated commit list.
+      # A commit list tells you what was typed and the changelog tells you what it costs you, which is the only one of the two worth reading.
+      - name: Cut the changelog section
+        run: |
+          awk -v v="${{ needs.check.outputs.version }}" '
+            $0 ~ "^## " v " " { on = 1; next }
+            on && /^## / { exit }
+            on { print }
+          ' CHANGELOG.md > release-notes.md
+          test -s release-notes.md
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ inputs.tag || github.ref_name }}" \
+            --title "v${{ needs.check.outputs.version }}" \
+            --notes-file release-notes.md \
+            --verify-tag \
+            dist/*
+
+  # crates.io, in dependency order, last of all.
+  #
+  # A version on crates.io cannot be deleted or replaced, so this runs after every gate has passed and after the GitHub release exists.
+  # It is safe to run twice: a crate whose version is already up there is skipped rather than retried, which is what makes finishing a half published release a matter of dispatching this workflow again.
+  #
+  # The sleeps are for the rate limit on new crates, which is a burst of five and then one every ten minutes.
+  # The first release publishes seven crates that have never existed, so it will sit and wait for two of them, and there is nothing to do about that but wait.
+  crates:
+    needs: [check, verify, build, publish]
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Publish the crates
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          VERSION: ${{ needs.check.outputs.version }}
+        run: |
+          set -euo pipefail
+          agent="rugo release (https://github.com/tamnd/rugo)"
+          # Dependency order. cargo waits for each one to appear in the index before it returns, so the next crate in the list can resolve it.
+          # xtask is not here and never will be: it is repository chores, it is `publish = false`, and it would be a crates.io name held for nothing.
+          for crate in rugo-arena rugo-hash rugo-net rugo-resp rugo-map rugo-server rugo; do
+            code=$(curl -sS -o /dev/null -w '%{http_code}' -A "$agent" \
+              "https://crates.io/api/v1/crates/$crate/$VERSION")
+            if [ "$code" = "200" ]; then
+              echo "$crate $VERSION is already published"
+              continue
+            fi
+            for attempt in 1 2 3 4 5 6; do
+              if cargo publish --locked -p "$crate" 2>&1 | tee /tmp/publish.log; then
+                break
+              fi
+              if ! grep -qi "too many\|rate limit\|429" /tmp/publish.log; then
+                echo "$crate failed for a reason that waiting will not fix" >&2
+                exit 1
+              fi
+              if [ "$attempt" = "6" ]; then
+                echo "$crate is still rate limited after an hour of waiting" >&2
+                exit 1
+              fi
+              echo "rate limited on $crate, waiting ten minutes before attempt $((attempt + 1))"
+              sleep 600
+            done
+          done

@@ -6,3 +6,10 @@ target/
 
 # Sweep output pulled back off a bench host for the scoreboard. The committed copy lives in bench/ and is the one SCOREBOARD.md is generated from; anything else here is scratch.
 /scratch
+
+# What the fuzzers accumulate. A corpus grows without bound and is worth keeping, just not here; an artifact is a crashing input, which belongs in a test the moment anybody looks at it.
+/fuzz/corpus
+/fuzz/artifacts
+
+# Names the bench machines. It stays out of a public repository for the same reason it does in cache-bench, and ci.yml fails if it is ever tracked.
+hosts.toml

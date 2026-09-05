@@ -1,0 +1,49 @@
+# Divergences
+
+Two lists. Where `rugo` answers a Redis client differently from the way Redis would, and where it departs from the pogocache architecture it takes its shape from.
+
+The rule for this file is that a divergence is either listed here or it is a bug. Nothing gets to be an undocumented improvement, and nothing gets to be an undocumented shortcut either.
+
+## From Redis
+
+`rugo` speaks RESP and answers to Redis command names, so a client library will connect to it and a benchmark harness will drive it. That makes every difference below something somebody can hit without being told, which is the only reason this section exists.
+
+The short version: this is a cache, not a database. Everything about durability, replication, transactions, scripting, pub/sub and data structures beyond a keyed byte string is missing rather than reduced, and the commands that would be about them are not implemented at all. An unknown command is an error rather than a silence, so a client finds out by being told.
+
+**R1, there is one keyspace and `SELECT` only takes 0.** Redis has sixteen databases and `SELECT n` moves between them. Here `SELECT 0` answers `OK` and anything else is `ERR DB index is out of range`. A client configured for database 3 is writing where it does not think it is, and answering `OK` to it would be the wrong kind of compatible.
+
+**R2, `maxmemory-policy` reports `allkeys-random` and is not settable.** The actual rule is neither `allkeys-random` nor `volatile-ttl`: two entries are drawn at random and whichever expires sooner goes, an entry with no expiry counting as expiring last. `allkeys-random` is the closest name Redis has and is what `CONFIG GET` answers, because a client that reads the setting is checking that eviction is on rather than reimplementing it. `CONFIG SET` answers `OK` and changes nothing, which is R3.
+
+**R3, `CONFIG SET` and `CONFIG RESETSTAT` answer `OK` and do nothing.** There is no runtime configuration here; every knob is a flag read at startup. Failing these would stop clients that set a timeout or a policy on connect from starting at all, which is a worse outcome than a setting that was already what they asked for. `CONFIG GET` is real, and answers four names: `maxmemory`, `maxmemory-policy`, `save` and `appendonly`. A name it does not know is left out of the reply, which is how Redis reports a setting it does not have. Globs are not supported beyond `*`.
+
+**R4, `COMMAND` answers an empty introspection.** `COMMAND` is an empty array, `COMMAND COUNT` is 0 and `COMMAND DOCS` is an empty map. Every client library treats that as "no help available" and falls back to sending commands, which is what they do against a server too old to answer. A wrong table would be worse than an empty one.
+
+**R5, `CLIENT` is a stub.** `CLIENT GETNAME` is null, `CLIENT ID` is 0, and everything else answers `OK`. There is no client registry, so `CLIENT LIST` and `CLIENT KILL` have nothing to report or kill and say so by not failing rather than by lying in detail.
+
+**R6, `INFO` is short, and three of its absences are worth knowing about.** The five sections and the field names are Redis's, so `used_memory`, `keyspace_hits`, `keyspace_misses`, `total_commands_processed` and `db0` are where a dashboard expects them. What is not there: `used_memory_rss`, because that is the process's resident set and this crate does not measure it and will not guess — whatever reports it should read it from the operating system; `connected_clients`, because connections are counted as they arrive and not tracked while they are open, so only `total_connections_received` is honest; and every replication, persistence and CPU field, because there is nothing behind them. An absent field is better than a plausible zero, which is a number somebody will graph.
+
+**R6a, the keyspace line always says `expires=0`.** Redis reports how many keys in the database carry an expiry. Counting that means walking every shard, and `INFO` is a command a monitoring agent runs every few seconds. `avg_ttl` is 0 for the same reason and is 0 in Redis too unless active expiry has sampled recently.
+
+**R7, `SHUTDOWN` exits without writing anything.** Redis may save first. There is nothing here to save, so the process exits and the connection closing is the answer, which is what Redis does when there is no save to do.
+
+**R8, `DEL` and `UNLINK` are the same command, and so are `FLUSHALL` and `FLUSHDB`.** `UNLINK` exists in Redis because freeing a large aggregate blocks the server; a cache entry is one allocation in a slab and there is nothing to defer. `FLUSHDB` differs from `FLUSHALL` only across databases, and there is one. `ASYNC` and `SYNC` are accepted and mean nothing.
+
+**R9, an expiry is stored to the second, and rounds up.** The entry header carries a `u32` of Unix seconds, so `PEXPIRE 1500` sets two seconds and `PTTL` always answers a multiple of a thousand. It rounds up rather than to nearest, so a key never dies sooner than it was asked to, only later — up to 999 ms later. Sub-second expiry costs four more bytes on every key that has one, which is a permanent price for a resolution a cache workload does not use. This is the divergence most likely to surprise somebody, and the one that would be most expensive to undo. The same `u32` puts the last representable expiry in 2106; `EXPIREAT` past that saturates there rather than wrapping.
+
+**R10, eviction is decided per shard rather than against a total.** `--maxmemory` is divided by the shard count and enforced against the lock each write already holds. A single shared counter read and written a million times a second is one cache line moving between every core in the machine, which costs more than the eviction it decides about. The price is that an unusually full shard evicts sooner than the whole cache being over would justify; with thousands of shards and a hash that spreads, the fullest shard runs within a small factor of the mean.
+
+## From pogocache
+
+`rugo` takes its architecture from [tidwall/pogocache](https://github.com/tidwall/pogocache) and none of its code. The shape — thousands of shards, a lock per shard, a poller per thread, an open-addressed table with the entries packed rather than allocated — is the same. What follows is where it deliberately is not, and each of these is a bet that a sweep will eventually settle.
+
+**P1, Swiss-table metadata instead of Robin Hood.** Pogocache's bucket is ten bytes: one distance-to-bucket byte, three hash bytes and a six byte pointer. Here it is five: one control byte holding a seven bit tag, and a four byte offset into the shard's arena. Probing is a group of slots at a time against a broadcast tag rather than a walk comparing distances, so the narrower metadata is not a trade against lookup speed. The cost is the four byte offset, which caps a shard's arena at four gigabytes; with thousands of shards that is a ceiling nothing reaches.
+
+**P2, a slab arena instead of `malloc` per entry.** Entries live in per-shard segments in size classes, addressed by offset, with a free list per class. That removes the eight to sixteen bytes of allocator header every `malloc` carries, and it means an entry's bytes are near the entries around it rather than wherever the allocator had room. The cost is that freed bytes go back on a free list and an emptied segment stays where it is, so resident memory is a high-water mark and does not fall when keys are deleted. `INFO` reports the charged bytes and the resident bytes separately rather than hiding the gap, which is the same distinction Redis draws between the memory it has used and the memory the operating system has given it.
+
+**P3, three probe implementations rather than one.** NEON, SSE2 and a word-at-a-time fallback. The fallback is not a courtesy: it is what runs on any target without a vector unit, and it is tested on every push because the machine this was written on compiles exactly one of the three.
+
+**P4, no `io_uring` yet.** Pogocache has it and it is most of what it wins with at depth. `--uring` is accepted here and does nothing; the backend is a later milestone. Any throughput number published before then is a number measured without it, and the scoreboard says so rather than explaining it away.
+
+**P5, one protocol rather than three.** Pogocache speaks RESP, the memcache text protocol and HTTP. This speaks RESP. The other two are a later milestone and their absence is why `cache-bench` can drive this at all today.
+
+**P6, `SO_REUSEPORT` is not used.** One shared listener sits in every thread's poller and whoever is free takes the connection, which is a thundering herd on every accept. `SO_REUSEPORT` gives each thread its own listener and the kernel does the spreading, and the plumbing for it exists in `rugo-net` unused. Which is faster on a real host is a question for a sweep rather than for an argument, and until there is a sweep the simpler one is in.

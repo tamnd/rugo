@@ -1,0 +1,39 @@
+[package]
+name = "rugo-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Its own workspace, not a member of the one above. cargo-fuzz builds with a sanitizer and its own nightly flags, and a member crate would drag both into every ordinary `cargo build --workspace` in the tree.
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+rugo-map = { path = "../crates/rugo-map" }
+rugo-resp = { path = "../crates/rugo-resp" }
+
+# Nothing here is a claim about speed, and a fuzzer that has to be built with fat link time optimisation is a fuzzer nobody runs. Debug assertions stay on: an overflow the release build would wrap is exactly what these are looking for.
+[profile.release]
+debug = true
+debug-assertions = true
+overflow-checks = true
+lto = false
+codegen-units = 16
+
+[[bin]]
+name = "resp"
+path = "fuzz_targets/resp.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "map"
+path = "fuzz_targets/map.rs"
+test = false
+doc = false
+bench = false

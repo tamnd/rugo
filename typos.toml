@@ -1,6 +1,9 @@
 [default.extend-words]
 # The protocol and the server are spelled this way by the projects that own them.
 memcache = "memcache"
+# A `SET` option, and Redis is what spells it. It is not a misspelling of "exact".
+EXAT = "EXAT"
+PXAT = "PXAT"
 
 [files]
 extend-exclude = ["Cargo.lock"]

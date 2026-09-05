@@ -1,0 +1,203 @@
+name: ci
+
+# Everything that runs on every push and every pull request.
+# The budget for this file is under three minutes to a verdict, because a check slower than the time it takes to switch to something else is a check people learn to scroll past.
+#
+# Nothing here measures throughput, and nothing here ever will.
+# A shared runner has neighbours, no pinned cores and no idea what else is on the socket, so a number from one is not a number.
+# The published numbers come from named hosts and land in `bench/`, and what this file checks about them is that `SCOREBOARD.md` is still the document those numbers produce.
+#
+# Memory is different, and the `memory` job below is the reason.
+# Bytes per entry is a property of the data structure rather than of the machine, so it can be asserted on a runner, and asserting it on every push is what keeps the memory half of the goal a measurement instead of a claim in a README.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # Incremental artifacts are large, slow to save and restore, and useless across the fresh checkout every job gets.
+  CARGO_INCREMENTAL: 0
+  # Debug info is most of what rustc emits and most of what the linker then has to work through, and no job here reads a backtrace line number.
+  CARGO_PROFILE_DEV_DEBUG: 0
+  CARGO_PROFILE_TEST_DEBUG: 0
+  RUSTFLAGS: -D warnings
+
+# Read only, and no job here widens it.
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Style first, so a run that is going to fail on formatting fails in under a minute rather than after the test matrix.
+  style:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2.9.2
+        with:
+          # Only main writes the cache.
+          # A pull request reads main's and skips the upload, which is twenty to forty seconds a job that nobody was getting anything back for.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets --all-features
+      # The fuzz targets are their own workspace, so nothing above has looked at them.
+      # They are the only place a `no_main` crate and a sanitizer meet this code, and a target that stops compiling is otherwise found by `deep.yml` the next morning at the earliest.
+      - run: cargo clippy --manifest-path fuzz/Cargo.toml --all-targets
+      # A workflow file that does not parse produces a run with no jobs in it, which reports as a failure with nothing to click on and no log.
+      # One unquoted colon in a run line is enough to do it.
+      - name: the workflow files parse
+        run: |
+          python3 - <<'PY'
+          import sys, yaml, pathlib
+          bad = False
+          for p in sorted(pathlib.Path(".github/workflows").glob("*.yml")):
+              try:
+                  yaml.safe_load(p.read_text())
+              except yaml.YAMLError as e:
+                  bad = True
+                  print(f"{p}: {e}")
+          sys.exit(1 if bad else 0)
+          PY
+
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: taiki-e/install-action@v2.87.3
+        with:
+          tool: cargo-nextest
+      - run: cargo nextest run --workspace --locked
+      # nextest runs one test per process and so cannot run doctests at all.
+      # They are most of what documents the map's memory accounting, so they get their own step rather than being quietly dropped.
+      - run: cargo test --workspace --locked --doc
+
+  # Half the goal of this project, asserted rather than described.
+  #
+  # A cache server's memory is a property of its data structure, not of the machine it runs on, so unlike throughput it can be measured on a runner and held to a number.
+  # `crates/rugo-map/tests/memory.rs` fills the map at several sizes and shard counts and fails if the index costs more per entry than the design allows.
+  # Run in release with the output shown, so the log carries the actual figures and a change that costs two bytes an entry is visible in the diff of two runs even when it still passes.
+  memory:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo test --locked --release -p rugo-map --test memory -- --nocapture
+
+  # Every generated document is the one the generator would write.
+  # `SCOREBOARD.md` is output, not source: it is a set of ratios computed from the sweep files committed in `bench/`.
+  # A ratio typed in by hand is a claim with no evidence attached, and this is what stops one being typed in.
+  generated:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo xtask check
+
+  # Two things that must never be in the tree, checked against what git is actually tracking rather than against what .gitignore says it should be.
+  # A file committed before the ignore rule existed stays tracked and the rule has no effect on it, which is exactly how both of these get in by accident.
+  hygiene:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: no host list, no fuzz corpus
+        run: |
+          if git ls-files --error-unmatch hosts.toml >/dev/null 2>&1; then
+            echo "hosts.toml is tracked, and it names machines that stay private" >&2
+            exit 1
+          fi
+          corpus=$(git ls-files 'fuzz/corpus/*' 'fuzz/artifacts/*')
+          if [ -n "$corpus" ]; then
+            echo "fuzz corpus or artifacts are tracked, and they grow without bound:" >&2
+            echo "$corpus" >&2
+            exit 1
+          fi
+
+  # The floor stays green too.
+  # It is the same floor as tamnd/yo and tamnd/cache-bench, so the three trees agree on what a supported compiler is.
+  msrv:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: dtolnay/rust-toolchain@1.94.0
+      - uses: Swatinem/rust-cache@v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # rust-toolchain.toml pins the working toolchain and has to be out of the way for this job to test what it says it tests.
+      - run: rm rust-toolchain.toml
+      - run: cargo test --workspace --locked
+
+  # Documentation is part of the interface.
+  # A broken intra doc link is a broken link in the published reference, so it fails the build.
+  docs:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: rm rust-toolchain.toml
+      - run: cargo doc --workspace --no-deps --all-features
+        env:
+          RUSTDOCFLAGS: -D warnings --cfg docsrs
+
+  # Every crate is publishable, checked on every push rather than on the day a tag is cut.
+  # A package only carries what is inside its own directory, so an include_str! that reaches up out of a crate builds here and fails for everybody who installs it.
+  package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo package --workspace --locked
+
+  # Licences, advisories and duplicate versions.
+  # This repository is Apache-2.0 and takes its architecture from an MIT project without taking its code, so the licence half is the half that has to stay boring.
+  deny:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: EmbarkStudios/cargo-deny-action@v2.1.1
+        with:
+          command: check all
+
+  typos:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: crate-ci/typos@v1.50.1

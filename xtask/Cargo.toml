@@ -12,5 +12,9 @@ keywords.workspace = true
 categories.workspace = true
 publish = false
 
+[dependencies]
+# The sweep files come out of cache-bench, which is a different repository on a different release cycle. They are read as values rather than into structs on purpose: a field added there should not stop the scoreboard rendering here.
+serde_json = "1"
+
 [lints]
 workspace = true

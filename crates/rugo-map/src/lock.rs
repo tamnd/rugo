@@ -188,3 +188,73 @@ mod tests {
         );
     }
 }
+
+/// The lock under a model checker rather than under a stress test.
+///
+/// `nothing_is_lost_under_contention` above runs a hundred and sixty thousand increments and would find a lost update on the machine it ran on, on the day it ran, under the interleavings that machine happened to produce. That is evidence and not proof, and the orderings here are exactly the kind of thing that is right on x86 by accident and wrong on ARM in production: an `Acquire` written as `Relaxed` costs nothing on a machine that does not reorder loads and loses a whole entry on one that does.
+///
+/// Loom enumerates the interleavings instead, under a memory model that reorders everything the C++11 model permits. Two threads is what these are kept to, because loom's cost is exponential in the number of threads and the property being checked — that the lock is exclusive and that a release is seen by the next acquire — does not need a third to fail.
+///
+/// Built only under `--cfg loom`, which `deep.yml` sets and no ordinary build does.
+#[cfg(all(test, loom))]
+mod model {
+    use super::*;
+    use loom::sync::Arc;
+
+    #[test]
+    fn two_threads_never_hold_it_at_once() {
+        loom::model(|| {
+            let lock = Arc::new(Lock::new(0u32));
+            let other = Arc::clone(&lock);
+            let hand = loom::thread::spawn(move || {
+                *other.lock() += 1;
+            });
+            *lock.lock() += 1;
+            hand.join().unwrap();
+            // Two increments under a lock that is exclusive is two. Under one that is not, some interleaving reads nought twice and this is one.
+            assert_eq!(*lock.lock(), 2);
+        });
+    }
+
+    #[test]
+    fn what_one_thread_wrote_the_next_one_reads() {
+        // The release on drop and the acquire on take, which are the only reason the map's entries are visible across threads at all. A store that crossed the release would be a write the next holder cannot see, and loom reports that as a value it did not expect rather than as a rare corruption on a bench host.
+        loom::model(|| {
+            let lock = Arc::new(Lock::new([0u32; 2]));
+            let other = Arc::clone(&lock);
+            let hand = loom::thread::spawn(move || {
+                let mut held = other.lock();
+                held[0] = 1;
+                held[1] = 2;
+            });
+            {
+                let held = lock.lock();
+                // Either neither write is visible or both are. One without the other is a torn critical section.
+                assert!(
+                    (held[0] == 0 && held[1] == 0) || (held[0] == 1 && held[1] == 2),
+                    "half of a critical section was visible: {held:?}"
+                );
+            }
+            hand.join().unwrap();
+        });
+    }
+
+    #[test]
+    fn a_failed_try_means_somebody_else_has_it() {
+        loom::model(|| {
+            let lock = Arc::new(Lock::new(0u32));
+            let other = Arc::clone(&lock);
+            let hand = loom::thread::spawn(move || {
+                if let Some(mut held) = other.try_lock() {
+                    *held += 1;
+                }
+            });
+            if let Some(mut held) = lock.try_lock() {
+                *held += 1;
+            }
+            hand.join().unwrap();
+            // `try_lock` may fail spuriously, since it is a weak exchange, so between nought and two increments land. What may not happen is more than two, which is what a `try_lock` that handed the same lock to both threads would produce.
+            assert!(*lock.lock() <= 2);
+        });
+    }
+}

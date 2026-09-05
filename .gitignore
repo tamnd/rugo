@@ -1,0 +1,8 @@
+# Unanchored on purpose. The anchored form does not cover fuzz/target, which is how two hundred megabytes of object files end up committed.
+target/
+**/*.rs.bk
+*.profraw
+.DS_Store
+
+# Sweep output pulled back off a bench host for the scoreboard. The committed copy lives in bench/ and is the one SCOREBOARD.md is generated from; anything else here is scratch.
+/scratch

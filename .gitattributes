@@ -1,0 +1,5 @@
+# SCOREBOARD.md is generated and CI compares it byte for byte against a fresh render.
+# A CRLF checkout on Windows makes that comparison fail for a reason that has nothing to do with the numbers, so the line ending is fixed here rather than discovered there.
+* text=auto eol=lf
+
+*.png binary

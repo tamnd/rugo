@@ -1,0 +1,5 @@
+[toolchain]
+# Current stable.
+# The MSRV job in CI removes this file and uses 1.94, so both the pinned toolchain and the floor are tested on every pull request.
+channel = "1.98.0"
+components = ["rustfmt", "clippy"]

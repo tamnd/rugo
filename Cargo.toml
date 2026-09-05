@@ -1,0 +1,73 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/rugo",
+    "crates/rugo-arena",
+    "crates/rugo-hash",
+    "crates/rugo-map",
+    "crates/rugo-net",
+    "crates/rugo-resp",
+    "crates/rugo-server",
+    "xtask",
+]
+
+[workspace.package]
+# One minor per milestone, patches in between, and nothing here promises anything while the major is 0. See RELEASING.md.
+version = "0.1.0"
+edition = "2024"
+# The same floor as tamnd/yo and tamnd/cache-bench, so one toolchain covers all three and the MSRV job here means what it means there.
+rust-version = "1.94"
+license = "Apache-2.0"
+repository = "https://github.com/tamnd/rugo"
+authors = ["tamnd <tamnd87@gmail.com>"]
+readme = "README.md"
+keywords = ["cache", "key-value", "server", "resp", "memcache"]
+categories = ["caching", "database-implementations", "network-programming"]
+publish = true
+
+[workspace.dependencies]
+rugo-arena = { path = "crates/rugo-arena", version = "0.1.0" }
+rugo-hash = { path = "crates/rugo-hash", version = "0.1.0" }
+rugo-map = { path = "crates/rugo-map", version = "0.1.0" }
+rugo-net = { path = "crates/rugo-net", version = "0.1.0" }
+rugo-resp = { path = "crates/rugo-resp", version = "0.1.0" }
+rugo-server = { path = "crates/rugo-server", version = "0.1.0" }
+
+libc = "0.2"
+criterion = "0.8"
+# Only ever built under `--cfg loom`, which deep.yml sets and no ordinary build does.
+loom = "0.7"
+
+[workspace.lints.rust]
+missing_docs = "warn"
+unreachable_pub = "warn"
+# Unsafe is not banned here the way it is in cache-bench, because a SIMD probe and a slab arena cannot be written without it.
+# What stands in for the ban is `unsafe_op_in_unsafe_fn`, a safety comment on every block, and Miri and loom in deep.yml.
+unsafe_op_in_unsafe_fn = "deny"
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+cargo = { level = "warn", priority = -1 }
+undocumented_unsafe_blocks = "deny"
+panic = "deny"
+unwrap_used = "deny"
+expect_used = "warn"
+float_cmp = "deny"
+cast_possible_truncation = "deny"
+cast_precision_loss = "warn"
+multiple_crate_versions = "allow"
+
+# The numbers in SCOREBOARD.md are only meaningful against this profile. Anything published from a different one says so in the row.
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+
+[profile.bench]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+debug = true

@@ -1,0 +1,39 @@
+[graph]
+all-features = true
+
+[advisories]
+version = 2
+yanked = "deny"
+
+[licenses]
+version = 2
+confidence-threshold = 0.93
+# rugo itself is Apache-2.0. This list is what a dependency may be, and it is deliberately short.
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true
+deny = [
+    # The server is blocking and thread-per-core on purpose. An async runtime here is a scheduler between the socket and the map, which is the thing the design is trying not to have.
+    { crate = "tokio", reason = "rugo owns its event loop; see crates/rugo-net" },
+    { crate = "async-std", reason = "rugo owns its event loop; see crates/rugo-net" },
+    { crate = "smol", reason = "rugo owns its event loop; see crates/rugo-net" },
+    # The hot path allocates nothing and hashes with rugo-hash. A general purpose hasher or map here would be a silent regression of the thing being measured.
+    { crate = "hashbrown", reason = "the map is the product; see crates/rugo-map" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

@@ -1,0 +1,7 @@
+# A test that cannot unwrap has to invent a way to fail, and the inventions are worse than the unwrap: an `unwrap_or` that swallows the error it was meant to catch, or an `assert!(false)` that clippy objects to on other grounds. The lints stay denied everywhere they matter, which is the code that ships.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true
+
+# The map is a cache: names like `len`, `get` and `set` are the vocabulary of the thing being built, not accidental collisions with the standard library.
+doc-valid-idents = ["NEON", "SSE2", "SIMD", "LEB128", "RESP", "RESP2", "RESP3", "TTL", "io_uring", ".."]

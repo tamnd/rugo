@@ -1,0 +1,82 @@
+[
+  {
+    "cache": "memcache",
+    "version": "memcached 1.6.45",
+    "entries": 9999872,
+    "peak_rss": 6592897024,
+    "baseline_rss": 3559424,
+    "payload_bytes": 5188822464,
+    "processes": 1,
+    "note": ""
+  },
+  {
+    "cache": "dragonfly",
+    "version": "dragonfly v1.40.2-e94300e6990093ec093cfb00d60c2e77ea4907e4",
+    "entries": 9999872,
+    "peak_rss": 5498712064,
+    "baseline_rss": 28209152,
+    "payload_bytes": 5188822464,
+    "processes": 1,
+    "note": "Dragonfly preallocates per proactor, so part of this peak follows the thread count rather than the keys."
+  },
+  {
+    "cache": "valkey",
+    "version": "Valkey server v=9.1.2 sha=7f1dffed:0 malloc=jemalloc-5.3.0 bits=64 build=8312c810dd4805f6",
+    "entries": 9999872,
+    "peak_rss": 6196072448,
+    "baseline_rss": 10022912,
+    "payload_bytes": 5188822464,
+    "processes": 1,
+    "note": ""
+  },
+  {
+    "cache": "redis",
+    "version": "Redis server v=8.10.1 sha=3399357e:0 malloc=jemalloc-5.3.0 bits=64 build=3e11344a981039de",
+    "entries": 9999872,
+    "peak_rss": 6309138432,
+    "baseline_rss": 9617408,
+    "payload_bytes": 5188822464,
+    "processes": 1,
+    "note": ""
+  },
+  {
+    "cache": "garnet",
+    "version": "GarnetServer 2.1.5+00dc848633d66e3f7212d40614c2e697152d388a",
+    "entries": 9999872,
+    "peak_rss": 7650201600,
+    "baseline_rss": 80162816,
+    "payload_bytes": 5188822464,
+    "processes": 1,
+    "note": "Garnet sizes its index at startup, so part of this peak is a configuration rather than a consequence of the keys in it."
+  },
+  {
+    "cache": "pogocache",
+    "version": "pogocache 1.3.2",
+    "entries": 9999872,
+    "peak_rss": 6080102400,
+    "baseline_rss": 8814592,
+    "payload_bytes": 5188822464,
+    "processes": 1,
+    "note": ""
+  },
+  {
+    "cache": "yo",
+    "version": "yo 0.3.20",
+    "entries": 9999872,
+    "peak_rss": 5617102848,
+    "baseline_rss": 7868416,
+    "payload_bytes": 5188822464,
+    "processes": 1,
+    "note": ""
+  },
+  {
+    "cache": "rugo",
+    "version": "rugo 0.1.0",
+    "entries": 9999872,
+    "peak_rss": 5467254784,
+    "baseline_rss": 4341760,
+    "payload_bytes": 5188822464,
+    "processes": 1,
+    "note": ""
+  }
+]

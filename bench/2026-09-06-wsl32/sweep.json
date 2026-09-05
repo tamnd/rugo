@@ -1,0 +1,6 @@
+{
+  "host": "gpc",
+  "profile": "wsl32",
+  "date": "2026-09-06",
+  "note": "Memory only. `cache-bench mem` at ten million keys per engine, values drawn uniformly from 1 to 1024 bytes, eight server threads, 256 clients each writing its own slice of the key range exactly once. No throughput sweep has run on this host yet, so there is no `output.json` beside this file."
+}

@@ -4,9 +4,11 @@
 //!
 //! ```text
 //! bench/<id>/sweep.json    which host, which profile, which day
-//! bench/<id>/output.json   cache-bench's combined result file
+//! bench/<id>/output.json   cache-bench's combined result file, when a sweep has run
 //! bench/<id>/memory.json   what cb-mem measured, when it has run
 //! ```
+//!
+//! Only `sweep.json` has to be there. The two measurements are separate commands that take minutes and days respectively, and the one that finished first is worth publishing without waiting for the other. A directory with neither renders as a sweep that measured nothing, which is a mistake worth seeing rather than an error worth stopping for.
 //!
 //! `output.json` comes from another repository on another release cycle, so it is read as values rather than into structs: a field added to `cache-bench` should not stop the scoreboard here from rendering.
 //!
@@ -180,8 +182,13 @@ fn read_json(path: &Path) -> Result<Value, String> {
     serde_json::from_str(&text).map_err(|why| format!("{} is not JSON: {why}", path.display()))
 }
 
-/// The counted runs out of a `cache-bench` `output.json`.
+/// The counted runs out of a `cache-bench` `output.json`, if a sweep has run here.
+///
+/// Absent is not an error, the same way an absent `memory.json` is not. A memory measurement takes minutes and a sweep takes days, so the first sweep directory in this repository holds one and not the other.
 fn read_points(path: &Path) -> Result<Vec<Point>, String> {
+    if !path.is_file() {
+        return Ok(Vec::new());
+    }
     let file = read_json(path)?;
     points_of(&file).ok_or_else(|| format!("{} is not an array of runs", path.display()))
 }
@@ -328,10 +335,14 @@ fn render(sweeps: &[Sweep]) -> String {
 
 /// The throughput table for one sweep.
 fn throughput(out: &mut String, sweep: &Sweep) {
+    if sweep.points.is_empty() {
+        out.push_str("### Throughput\n\nNot measured in this sweep. There is no `output.json` here, so the throughput half of the gate has no row rather than a row that guesses.\n\n");
+        return;
+    }
     let by = peaks(&sweep.points);
     let Some((ours, our_depths)) = by.get("rugo") else {
         out.push_str(
-            "No rugo runs in this sweep, so there is nothing to take a ratio against.\n\n",
+            "### Throughput\n\nNo rugo runs in this sweep, so there is nothing to take a ratio against.\n\n",
         );
         return;
     };
@@ -425,7 +436,7 @@ const HEAD: &str = "\
 
 rugo against every server `cache-bench` measures, on the gate this project set itself: twice the throughput of any rival, and half the memory per entry.
 
-Every number here is generated from a committed `output.json` that ships beside it in `bench/`, so any row can be recomputed from the data rather than taken on trust. Nothing here was measured on a laptop; each sweep names the host and the profile it ran under, and two numbers from two machines are not comparable.
+Every number here is generated from committed measurement files that ship beside it in `bench/`, so any row can be recomputed from the data rather than taken on trust. Nothing here was measured on a laptop; each sweep names the host and the profile it ran under, and two numbers from two machines are not comparable.
 
 The pogocache row is expected to read `not yet` for a long time, and it is published anyway. A gate that is only published once it passes is not a gate.
 

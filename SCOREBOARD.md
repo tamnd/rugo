@@ -4,15 +4,37 @@
 
 rugo against every server `cache-bench` measures, on the gate this project set itself: twice the throughput of any rival, and half the memory per entry.
 
-Every number here is generated from a committed `output.json` that ships beside it in `bench/`, so any row can be recomputed from the data rather than taken on trust. Nothing here was measured on a laptop; each sweep names the host and the profile it ran under, and two numbers from two machines are not comparable.
+Every number here is generated from committed measurement files that ship beside it in `bench/`, so any row can be recomputed from the data rather than taken on trust. Nothing here was measured on a laptop; each sweep names the host and the profile it ran under, and two numbers from two machines are not comparable.
 
 The pogocache row is expected to read `not yet` for a long time, and it is published anyway. A gate that is only published once it passes is not a gate.
 
-## No sweep yet
+## 2026-09-06-wsl32
 
-`bench/` is empty, so there is nothing to report. rugo builds, passes its tests and serves, and that is a different claim from being faster than anything.
+Host `gpc`, profile `wsl32`, finished 2026-09-06.
 
-rugo is `cache-bench`'s eighth subject and its memory metric exists, so what is left before the first sweep is provisioning the two bench hosts and running it. Until then this document has no numbers in it, which is the honest state rather than an empty table that looks like a result.
+Memory only. `cache-bench mem` at ten million keys per engine, values drawn uniformly from 1 to 1024 bytes, eight server threads, 256 clients each writing its own slice of the key range exactly once. No throughput sweep has run on this host yet, so there is no `output.json` beside this file.
+
+### Throughput
+
+Not measured in this sweep. There is no `output.json` here, so the throughput half of the gate has no row rather than a row that guesses.
+
+### Memory
+
+Two different claims, kept in two different columns. Total is the whole resident set divided by the keys in it, which is what a machine has to have. Overhead is what is left after the keys and values themselves, which is what the design is about. At a hundred-odd bytes of payload a key, no index can halve the first number, and the second is where the difference actually lives.
+
+Ratios are the rival over rugo, so above one means rugo is smaller and the gate is two.
+
+| rival | total B/entry | rival/rugo total | overhead B/entry | rival/rugo overhead | gate on overhead |
+|---|---:|---:|---:|---:|---|
+| dragonfly | 549.9 | 1.01x | 31.0 | 1.11x | not yet |
+| garnet | 765.0 | 1.40x | 246.1 | 8.84x | pass |
+| memcache | 659.3 | 1.21x | 140.4 | 5.04x | pass |
+| pogocache | 608.0 | 1.11x | 89.1 | 3.20x | pass |
+| redis | 630.9 | 1.15x | 112.0 | 4.02x | pass |
+| valkey | 619.6 | 1.13x | 100.7 | 3.62x | pass |
+| yo | 561.7 | 1.03x | 42.8 | 1.54x | not yet |
+
+rugo held 9999872 keys in 546.7 total bytes each, of which 27.8 was overhead.
 
 ## What these numbers are not
 

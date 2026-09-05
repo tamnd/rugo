@@ -10,9 +10,11 @@ Apache-2.0. The architecture is taken from [tidwall/pogocache](https://github.co
 
 Twice the throughput of any comparable server, and half the memory per entry.
 
-That is a hard target and it is stated as one. Whether it is met is a measurement, and the measurement lives in [SCOREBOARD.md](SCOREBOARD.md), which is generated from sweep data committed alongside it and checked on every push so a ratio cannot be typed in by hand. **It currently says that no sweep has been published.** rugo builds, passes its tests and serves, and that is a different claim from being faster than anything.
+That is a hard target and it is stated as one. Whether it is met is a measurement, and the measurement lives in [SCOREBOARD.md](SCOREBOARD.md), which is generated from measurement files committed alongside it and checked on every push so a ratio cannot be typed in by hand.
 
-When there are numbers they will come from [tamnd/cache-bench](https://github.com/tamnd/cache-bench) driving `memtier_benchmark` on named hosts, against memcached, Redis, Valkey, Dragonfly, Garnet, pogocache and yo. Nothing measured on a laptop goes in: two runs of identical code on the development machine here disagreed by 198 percent, which is not a measurement.
+**As of the first measurement it says: memory measured, throughput not.** On overhead per entry rugo is smaller than Garnet, memcached, Redis, Valkey and pogocache by more than the factor of two the gate asks for, and smaller than Dragonfly and yo by less than it. No throughput sweep has run, so half the gate has no row at all rather than a row that guesses.
+
+The numbers come from [tamnd/cache-bench](https://github.com/tamnd/cache-bench) driving `memtier_benchmark` on named hosts, against memcached, Redis, Valkey, Dragonfly, Garnet, pogocache and yo. Nothing measured on a laptop goes in: two runs of identical code on the development machine here disagreed by 198 percent, which is not a measurement.
 
 The memory half needs two numbers and they are different claims. Total bytes per entry is the whole resident set divided by the keys in it, which is what a machine has to have. Overhead bytes per entry is what is left after the keys and the values themselves, which is what the design is actually about. At a hundred-odd bytes of payload per key no index can halve the first of those, whatever it does to the second, and the scoreboard reports both in separate columns rather than quoting whichever one flatters.
 

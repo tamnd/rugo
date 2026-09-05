@@ -46,10 +46,12 @@ pub const MIN_SEGMENT: usize = if segment::LAZY { 1024 * 1024 } else { 4 * 1024 
 /// The largest a segment grows to.
 ///
 /// A cap rather than a target. Eight megabytes is what a twenty-one bit unit offset can address at a four byte grain, so it is also the ceiling the reference width imposes, and at the one thousand and twenty-four segments a reference can name it puts eight gigabytes in reach of one shard of thousands.
+///
+/// Two megabytes rather than one where a segment is a boxed slice, because the segment count is what paid for the offset bit the finer grain needed and halving it would otherwise halve what a shard can address. The reach a shard has on that path is the segment count times this, so doubling one against the other's halving leaves it where it was, at just under two gigabytes.
 pub const MAX_SEGMENT: usize = if segment::LAZY {
     8 * 1024 * 1024
 } else {
-    1024 * 1024
+    2 * 1024 * 1024
 };
 
 /// The allocation grain, and the alignment every [`Ref`] therefore has.

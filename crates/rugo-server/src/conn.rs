@@ -7,6 +7,7 @@ use std::net::TcpStream;
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 
+use rugo_net::Interest;
 use rugo_resp::{Command, Dialect, Encoder, Parsed};
 
 use crate::dispatch::{self, Env, Reply};
@@ -123,6 +124,12 @@ pub(crate) struct Conn {
     command: Command,
     /// Set when the last reply has been written and the connection should go.
     closing: bool,
+    /// What the poller was last told to watch this socket for.
+    ///
+    /// Held so that a turn wanting what the poller is already doing can skip the `epoll_ctl`, which in steady state is every turn: a connection that is reading commands and answering them wants to read again, which is what it was already registered for. At a pipeline depth of twenty-five that syscall was a third of the three this connection made per batch and it bought nothing.
+    ///
+    /// This is safe to track because both pollers are level triggered and a registration persists until it is changed or the descriptor is closed, so what was asked for last is what is still in force. It is one field written in one place, [`Conn::arm`], and the alternative to keeping it is paying a syscall a batch to avoid a bool.
+    armed: Interest,
 }
 
 impl Conn {
@@ -139,6 +146,8 @@ impl Conn {
             dialect: Dialect::default(),
             command: Command::new(),
             closing: false,
+            // What `take` registers a freshly accepted connection for. A connection whose first turn wants exactly this makes no `epoll_ctl` at all.
+            armed: Interest::READ,
         }
     }
 
@@ -146,6 +155,21 @@ impl Conn {
     #[must_use]
     pub(crate) fn fd(&self) -> RawFd {
         self.stream.as_raw_fd()
+    }
+
+    /// What the poller is currently watching this socket for.
+    ///
+    /// Read by whoever accepts the connection to decide what to register it as, so the field and the registration cannot drift apart: there is one answer and both sites use it.
+    #[must_use]
+    pub(crate) fn armed(&self) -> Interest {
+        self.armed
+    }
+
+    /// Record that the poller has been told to watch this socket for `want`.
+    ///
+    /// Called only after the `modify` it describes has succeeded, so a failed registration leaves the field saying what is actually in force rather than what was wanted.
+    pub(crate) fn arm(&mut self, want: Interest) {
+        self.armed = want;
     }
 
     /// Read what is there, answer it, and write what fits.

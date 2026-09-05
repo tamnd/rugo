@@ -449,6 +449,42 @@ fn inline_commands_and_pipelines_arrive_the_way_they_were_sent() {
 }
 
 #[test]
+fn a_reply_too_big_for_the_socket_arrives_whole() {
+    // The path where a turn wants something different from what the poller is already doing, which is the only path that still re-registers a descriptor.
+    //
+    // A reply larger than the socket's send buffer cannot be written in one go, so the connection asks to be told when it is writable, gets told, drains, and asks to go back to being told when it is readable. Every one of those steps is a change of interest, and a connection that never got re-registered for writing would stop here with the client waiting for bytes that were never sent.
+    //
+    // Two hundred and fifty-six values of eight kilobytes is two megabytes of reply against a send buffer that is a few hundred kilobytes at most on either platform, so the write blocks partway whatever the operating system chose.
+    let mut client = talking();
+
+    let value = "v".repeat(8 * 1024);
+    let count = 256;
+    for n in 0..count {
+        client.ask(&["SET", &format!("big{n}"), &value], "+OK\r\n");
+    }
+
+    let mut words = vec!["MGET".to_owned()];
+    for n in 0..count {
+        words.push(format!("big{n}"));
+    }
+    let borrowed: Vec<&str> = words.iter().map(String::as_str).collect();
+
+    let mut expect = format!("*{count}\r\n");
+    for _ in 0..count {
+        let _ = write!(expect, "${}\r\n{value}\r\n", value.len());
+    }
+    assert!(
+        expect.len() > 2 * 1024 * 1024,
+        "{} bytes is not big enough to block a write",
+        expect.len()
+    );
+    client.ask(&borrowed, &expect);
+
+    // And the connection is usable afterwards, which is what says it went back to watching for reads rather than staying armed for a write nobody owes.
+    client.ask(&["PING"], "+PONG\r\n");
+}
+
+#[test]
 fn a_command_this_server_does_not_have_is_an_error_rather_than_a_silence() {
     let mut client = talking();
 

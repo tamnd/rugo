@@ -274,8 +274,11 @@ impl Worker<'_> {
                             read: true,
                             write: turn == Turn::Write,
                         };
-                        // Re-registered every turn rather than only when it changed, because a `modify` is a syscall on a descriptor this thread owns and tracking the last interest to avoid it would be state that can go wrong.
-                        poller.modify(conn.fd(), event.token, want)?;
+                        // Registered only when it changed. Both pollers are level triggered, so a registration stays in force until something changes it, and a connection reading commands and answering them wants next what it wanted last. Re-registering anyway cost a syscall per batch to restate a fact the kernel already held.
+                        if conn.armed() != want {
+                            poller.modify(conn.fd(), event.token, want)?;
+                            conn.arm(want);
+                        }
                     }
                     Turn::Close => {
                         let _ = poller.remove(conn.fd());
@@ -307,6 +310,8 @@ impl Worker<'_> {
             }
             let conn = Conn::new(stream);
             let fd = conn.fd();
+            // What the connection already believes it is registered for, rather than a second copy of that constant here. A connection whose first turn wants this makes no `epoll_ctl` at all, and the two cannot drift into disagreeing.
+            let interest = conn.armed();
 
             let at = if let Some(at) = free.pop() {
                 conns[at] = Some(conn);
@@ -317,7 +322,7 @@ impl Worker<'_> {
             };
 
             let token = u64::try_from(at + self.listeners.len()).unwrap_or(u64::MAX);
-            if let Err(error) = poller.add(fd, token, Interest::READ) {
+            if let Err(error) = poller.add(fd, token, interest) {
                 conns[at] = None;
                 free.push(at);
                 return Err(error);

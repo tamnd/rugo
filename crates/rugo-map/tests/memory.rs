@@ -143,20 +143,29 @@ fn an_entry_costs_its_header_and_nothing_but_the_grain() {
 }
 
 #[test]
-fn the_arena_holds_under_a_tenth_in_reserve() {
-    // The segment that has been allocated and not yet written into. A doubling rule put nearly a hundred percent here, which was the single largest fault the gate caught; growing by a sixteenth puts it in the low single digits, and a tenth is the line past which the growth rule has regressed rather than drifted.
+fn the_arena_holds_little_beyond_what_it_handed_out() {
+    // Everything the arena is charged for that is neither the index nor an entry: the part of the newest segment nothing has been written into, and the tails abandoned where a segment ended too short for the next entry.
+    //
+    // Which of those dominates is a property of the platform, so the bound is too, and each half of it names the mechanism it bounds.
+    //
+    // Where a segment is a mapping the reserve is address space and costs nothing. What is left is a part-used last page per shard, which is a floor and not a rate: four thousand shards is sixteen megabytes on a four kilobyte page whether they hold ten entries each or ten thousand. It is charged as a floor, plus two per cent for the tails.
+    //
+    // Where a segment is a boxed slice the reserve is real memory. A doubling rule put nearly a hundred per cent here, which was the single largest fault this gate ever caught; a sixteenth puts it in the low single digits, and a tenth is the line past which that rule has regressed rather than drifted.
     for &(count, value_len, shards) in SHAPES {
         let cost = fill(count, value_len, shards);
-        let reserve = cost.resident - cost.index - cost.live;
-        let share = reserve as f64 / cost.live as f64;
+        let slack = cost.resident - cost.index - cost.live;
+        let allowed = if rugo_arena::LAZY_RESERVE {
+            shards * rugo_arena::granule() + cost.live / 50
+        } else {
+            cost.live / 10
+        };
         println!(
-            "{count}x{value_len} over {shards} shards: {:.1}% held in reserve",
-            share * 100.0
+            "{count}x{value_len} over {shards} shards: {slack} bytes beyond the entries, {allowed} allowed ({:.1}% of what was handed out)",
+            slack as f64 / cost.live as f64 * 100.0
         );
         assert!(
-            share < 0.10,
-            "the arena held {:.1}% more than it had handed out, for {count} entries of {value_len} over {shards} shards",
-            share * 100.0
+            slack <= allowed,
+            "the arena held {slack} bytes beyond what it handed out against {allowed} allowed, for {count} entries of {value_len} over {shards} shards"
         );
     }
 }
@@ -192,21 +201,30 @@ fn one_key_does_not_wake_four_thousand_shards() {
     map.set(b"only", b"one", None, None).unwrap();
     let resident = map.resident_bytes();
     println!("4096 shards holding one key cost {resident} bytes");
+    // Sixty-four kilobytes rather than eight, because a shard's arena is charged in whole pages and a page is sixteen kilobytes on Apple silicon. The number this is really distinguishing is four thousand shards each waking, which is sixteen megabytes at the smallest page there is, so anything in kilobytes says one shard woke.
     assert!(
-        resident < 8 * 1024,
+        resident < 64 * 1024,
         "{resident} bytes to hold one key across 4096 shards"
     );
 }
 
 #[test]
 fn sharding_does_not_cost_much_at_scale() {
-    // Sixty-four shards against four thousand over the same working set. Every shard carries its own index and its own arena reserve, so more shards is strictly more slack; the claim is that at a million entries the slack is small enough that the concurrency is worth having.
-    let few = fill(1_000_000, 100, 64).total();
-    let many = fill(1_000_000, 100, 4096).total();
-    println!("{few:.2} bytes per entry over 64 shards, {many:.2} over 4096");
+    // Sixty-four shards against four thousand over the same working set. Every shard carries its own index and its own part-used last page, so more shards is strictly more slack; the claim is that at a million entries the slack is small enough that the concurrency is worth having.
+    //
+    // Where segments are mappings that slack is four thousand and thirty-two more part-used pages, which is a quantity this can state exactly rather than guess at as a percentage, so it does. Two per cent on top covers the index growing with the shard count and the extra tails.
+    const ENTRIES: u32 = 1_000_000;
+    let few = fill(ENTRIES, 100, 64).total();
+    let many = fill(ENTRIES, 100, 4096).total();
+    let allowed = if rugo_arena::LAZY_RESERVE {
+        ((4096 - 64) * rugo_arena::granule()) as f64 / f64::from(ENTRIES) + few * 0.02
+    } else {
+        few * 0.10
+    };
+    println!("{few:.2} bytes per entry over 64 shards, {many:.2} over 4096, {allowed:.2} allowed");
     assert!(
-        many < few * 1.10,
-        "going from 64 shards to 4096 cost {:.1}% more memory per entry",
-        (many / few - 1.0) * 100.0
+        many - few <= allowed,
+        "going from 64 shards to 4096 cost {:.2} bytes an entry against {allowed:.2} allowed",
+        many - few
     );
 }

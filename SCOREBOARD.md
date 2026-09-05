@@ -36,6 +36,34 @@ Ratios are the rival over rugo, so above one means rugo is smaller and the gate 
 
 rugo held 9999872 keys in 546.7 total bytes each, of which 27.8 was overhead.
 
+## 2026-09-06-wsl32-mapped-arena
+
+Host `gpc`, profile `wsl32`, finished 2026-09-06.
+
+Memory only, and the same measurement as the sweep above it with one change in rugo: a segment of the arena is now an anonymous mapping, so the part of it nothing has been written into costs address space rather than memory. The two sweeps are here side by side because the difference between them is the point. Every other engine was rebuilt and re-measured in the same run rather than carried over, so the rows are comparable with each other and not only with themselves. `cache-bench mem` at ten million keys per engine, values drawn uniformly from 1 to 1024 bytes, eight server threads, 256 clients each writing its own slice of the key range exactly once. No throughput sweep has run on this host yet, so there is no `output.json` beside this file.
+
+### Throughput
+
+Not measured in this sweep. There is no `output.json` here, so the throughput half of the gate has no row rather than a row that guesses.
+
+### Memory
+
+Two different claims, kept in two different columns. Total is the whole resident set divided by the keys in it, which is what a machine has to have. Overhead is what is left after the keys and values themselves, which is what the design is about. At a hundred-odd bytes of payload a key, no index can halve the first number, and the second is where the difference actually lives.
+
+Ratios are the rival over rugo, so above one means rugo is smaller and the gate is two.
+
+| rival | total B/entry | rival/rugo total | overhead B/entry | rival/rugo overhead | gate on overhead |
+|---|---:|---:|---:|---:|---|
+| dragonfly | 550.6 | 1.02x | 31.7 | 1.55x | not yet |
+| garnet | 764.5 | 1.42x | 245.6 | 12.04x | pass |
+| memcache | 658.2 | 1.22x | 139.3 | 6.83x | pass |
+| pogocache | 607.7 | 1.13x | 88.8 | 4.35x | pass |
+| redis | 630.7 | 1.17x | 111.8 | 5.48x | pass |
+| valkey | 619.7 | 1.15x | 100.8 | 4.94x | pass |
+| yo | 562.2 | 1.04x | 43.3 | 2.12x | pass |
+
+rugo held 9999872 keys in 539.3 total bytes each, of which 20.4 was overhead.
+
 ## What these numbers are not
 
 They are not a claim about any workload but this one. `cache-bench` drives `memtier_benchmark` at a fixed key and value size through a fixed pipeline, and a cache server tuned for that is tuned for that.

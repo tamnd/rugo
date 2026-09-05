@@ -1,0 +1,6 @@
+{
+  "host": "gpc",
+  "profile": "wsl32",
+  "date": "2026-09-06",
+  "note": "Memory only, and the same measurement as the sweep above it with one change in rugo: a segment of the arena is now an anonymous mapping, so the part of it nothing has been written into costs address space rather than memory. The two sweeps are here side by side because the difference between them is the point. Every other engine was rebuilt and re-measured in the same run rather than carried over, so the rows are comparable with each other and not only with themselves. `cache-bench mem` at ten million keys per engine, values drawn uniformly from 1 to 1024 bytes, eight server threads, 256 clients each writing its own slice of the key range exactly once. No throughput sweep has run on this host yet, so there is no `output.json` beside this file."
+}

@@ -16,9 +16,17 @@
 //!
 //! # Why segments grow
 //!
-//! Splitting the reference into a segment number and an offset, rather than treating it as one flat unit index, is what lets segments differ in size, and that is what keeps a shard that holds three keys from costing what a shard that holds three million does. The first segment is [`MIN_SEGMENT`] and each one after it is a sixteenth of what the arena already holds, up to [`MAX_SEGMENT`]. See `next_segment_size` for why a sixteenth and not a doubling.
+//! Splitting the reference into a segment number and an offset, rather than treating it as one flat unit index, is what lets segments differ in size, and that is what keeps a shard that holds three keys from costing what a shard that holds three million does. The first segment is [`MIN_SEGMENT`] and each one after it is larger, up to [`MAX_SEGMENT`]. See `next_segment_size` for by how much and why.
 //!
 //! One fixed segment size has to choose between a floor and a tail. Large segments mean a cache with four thousand shards pays that size four thousand times over before it is useful; small segments mean a segment ends every time its tail is too short for the next entry. Growing segments have the small floor, and the tail is not lost either: it goes on the free list of whatever class it happens to be, which is what makes the small floor affordable.
+//!
+//! # The reserve, and why it is usually free
+//!
+//! The part of the newest segment nothing has been written into yet is the arena's reserve, and it was the largest single item of overhead in the cache: seven per cent of everything held, measured on a million hundred byte entries across four thousand shards, against about ten bytes an entry for the index and four for the grain.
+//!
+//! It is now mostly not there. A segment is its own anonymous mapping, so a page of it costs nothing until something is written to it, and the reserve is address space rather than memory. See [`segment`](mod@segment) for which platforms that holds on and what the others do instead. The floor argument above survives it — an untouched mapping is free whatever its size — which is why the growth rule is a doubling again rather than the sixteenth it had to be when the reserve was real.
+//!
+//! Two numbers come out of that and they are different questions. [`Arena::resident_bytes`] is what the operating system is charging for, which counts the reserve only where the reserve is real. [`Arena::mapped_bytes`] is the address space, which counts all of it. The first is the one the memory claim is made against and the second is the one that explains a surprising `VSZ`.
 //!
 //! # What it does not do
 //!
@@ -26,18 +34,39 @@
 
 use core::mem::size_of;
 
+mod segment;
+
+use segment::Segment;
+
 /// The first segment a shard allocates.
 ///
-/// Small, because with four thousand shards this is multiplied by four thousand as soon as every shard holds one key, and a cache holding four thousand keys should not cost a quarter of a gigabyte.
-pub const MIN_SEGMENT: usize = 4 * 1024;
+/// A megabyte where a segment is a mapping, because the pages of it nobody has written to cost nothing and the only thing a small first segment would buy is more mappings. Four kilobytes where it is not, because there the whole segment is resident the moment it exists and four thousand shards would multiply it by four thousand.
+pub const MIN_SEGMENT: usize = if segment::LAZY { 1024 * 1024 } else { 4 * 1024 };
 
 /// The largest a segment grows to.
 ///
-/// A cap rather than a target: once a shard holds sixteen megabytes a sixteenth of that is a megabyte, and a segment larger than that is a lot to hold in reserve for a marginal saving in list length.
-pub const MAX_SEGMENT: usize = 1024 * 1024;
+/// A cap rather than a target. Eight megabytes is what a twenty bit unit offset can address, so it is also the ceiling the reference width imposes, and at [`MAX_SEGMENTS`] segments it puts sixteen gigabytes in reach of one shard of thousands.
+pub const MAX_SEGMENT: usize = if segment::LAZY {
+    8 * 1024 * 1024
+} else {
+    1024 * 1024
+};
 
 /// The allocation grain, and the alignment every [`Ref`] therefore has.
 pub const GRAIN: usize = 8;
+
+/// Whether the part of a segment nothing has been written into is free.
+///
+/// True where a segment is an anonymous mapping, which is every platform rugo publishes a memory number from. False where it is a boxed slice, where those bytes are as resident as any other. A memory gate has to know which, because it is the difference between a reserve that costs nothing and one that is the largest single item of overhead in the cache.
+pub const LAZY_RESERVE: bool = segment::LAZY;
+
+/// The unit arena storage is charged in: a page where segments are mappings, one byte where they are not.
+///
+/// Where this is a page it is also a floor. A shard's last page is only partly used, and four thousand shards is four thousand part-used pages whether they hold ten entries each or ten thousand, so it is a fixed cost of sharding finely rather than a rate on the entries.
+#[must_use]
+pub fn granule() -> usize {
+    segment::granule()
+}
 
 /// The largest allocation the slab serves. Anything above this becomes an oversized entry.
 ///
@@ -64,8 +93,8 @@ const CLASSES: usize = SMALL_MAX / GRAIN;
 
 /// The reciprocal of how much a new segment adds to what the arena already holds.
 ///
-/// Sixteen, so a segment is a sixteenth. See `next_segment_size`.
-const GROWTH: usize = 16;
+/// One where a segment is a mapping, so a segment is as large as everything before it and the arena doubles. Sixteen where it is not, so a segment is a sixteenth. See `next_segment_size`.
+const GROWTH: usize = if segment::LAZY { 1 } else { 16 };
 
 /// A reference to bytes in an [`Arena`], four bytes wide.
 ///
@@ -105,6 +134,10 @@ pub enum Full {
     Slab,
     /// The shard's oversized table has as many live entries as a reference can name.
     Large,
+    /// The operating system refused a segment.
+    ///
+    /// Distinct from [`Full::Slab`] because it is a different fact about the world. The slab being full says this shard has run out of the addresses a four byte reference can name while the machine may have plenty of memory; this says the machine does not.
+    Memory,
 }
 
 impl core::fmt::Display for Full {
@@ -112,6 +145,7 @@ impl core::fmt::Display for Full {
         match self {
             Self::Slab => f.write_str("this shard's slab is full"),
             Self::Large => f.write_str("this shard's oversized table is full"),
+            Self::Memory => f.write_str("the operating system would not give this shard memory"),
         }
     }
 }
@@ -122,17 +156,22 @@ impl core::error::Error for Full {}
 ///
 /// One [`GROWTH`]th of what is there, rounded up to a whole [`MIN_SEGMENT`] and held between that and [`MAX_SEGMENT`].
 ///
-/// Doubling is the obvious rule and it is the wrong one. Under doubling the newest segment is as large as every earlier one put together, so an arena holds up to twice what it has handed out and half of that is a segment nobody has written to. Measured on a million hundred byte entries across four thousand shards, doubling cost two hundred and fifty-six bytes an entry against a hundred and twenty-four of payload. A sixteenth costs a few percent, because the newest segment is a seventeenth of the total rather than half of it.
+/// Which rule is right depends entirely on what the newest segment costs before anything is written into it, and that is the question [`segment`](mod@segment) answers.
 ///
-/// The price is more segments: about a hundred and forty to reach the [`MAX_SEGMENT`] ceiling, against eight under doubling. A segment costs one `Box<[u8]>` in a list, which is sixteen bytes, so a hundred and forty of them is two kilobytes against the sixteen megabytes they address, and [`MAX_SEGMENTS`] still leaves room for nearly two thousand more.
+/// Where the reserve is real, doubling is the wrong rule: the newest segment is as large as every earlier one put together, so the arena holds up to twice what it has handed out and half of that is memory nobody has used. Measured on a million hundred byte entries across four thousand shards, doubling cost two hundred and fifty-six bytes an entry against a hundred and twenty-four of payload, and a sixteenth cost a few per cent. That is why [`GROWTH`] is sixteen there.
+///
+/// Where the reserve is address space, the argument reverses. An untouched page costs nothing at any segment size, so the only thing a small segment buys is a longer list of them, and the list is not free: a mapping is a kernel object, a cache of four thousand shards has thousands of them at once, and Linux refuses the sixty-five thousand and five hundred and thirty-first. A sixteenth would put a five gigabyte cache within sight of that limit and a hundred gigabyte one well past it. Doubling puts a five gigabyte cache at about eight thousand mappings and a hundred gigabyte one at about twenty thousand, and reaches the [`MAX_SEGMENT`] ceiling in four steps.
 #[inline]
 #[must_use]
 const fn next_segment_size(held: usize) -> usize {
-    let wanted = (held / GROWTH).next_multiple_of(MIN_SEGMENT);
+    let share = held / GROWTH;
+    // The ceiling is applied before the rounding up and not after, because under a doubling the share is the whole of what is held and rounding that up would overflow. [`MAX_SEGMENT`] is a whole number of [`MIN_SEGMENT`], so a share under the ceiling still rounds to something under it.
+    if share >= MAX_SEGMENT {
+        return MAX_SEGMENT;
+    }
+    let wanted = share.next_multiple_of(MIN_SEGMENT);
     if wanted < MIN_SEGMENT {
         MIN_SEGMENT
-    } else if wanted > MAX_SEGMENT {
-        MAX_SEGMENT
     } else {
         wanted
     }
@@ -156,8 +195,8 @@ const fn narrow(count: usize) -> u32 {
 /// Not synchronised. The shard's lock is what makes it safe to use, and putting a second lock here would be paying twice for one guarantee.
 #[derive(Debug)]
 pub struct Arena {
-    /// Backing storage, allocated on first use and growing by a sixteenth up to [`MAX_SEGMENT`].
-    segments: Vec<Box<[u8]>>,
+    /// Backing storage, allocated on first use and growing up to [`MAX_SEGMENT`].
+    segments: Vec<Segment>,
     /// The segment new allocations are being cut from.
     seg: u32,
     /// The next unallocated unit within that segment.
@@ -176,7 +215,7 @@ pub struct Arena {
     dead: usize,
     /// Bytes held by live oversized blocks, kept as a running total.
     large_live: usize,
-    /// Bytes held by segments, kept as a running total so that reporting memory is not a walk.
+    /// Bytes mapped by segments, kept as a running total so that reporting memory is not a walk.
     segment_bytes: usize,
 }
 
@@ -279,9 +318,11 @@ impl Arena {
         if self.segments.len() >= MAX_SEGMENTS {
             return Err(Full::Slab);
         }
-        let size = next_segment_size(self.segment_bytes);
-        self.segments.push(vec![0u8; size].into_boxed_slice());
-        self.segment_bytes += size;
+        let segment = Segment::new(next_segment_size(self.segment_bytes)).ok_or(Full::Memory)?;
+        // A unit offset is [`OFF_BITS`] wide, so a segment longer than that many grains has bytes no reference could name. [`MAX_SEGMENT`] is chosen to sit exactly on that bound and page rounding cannot move it, because every size the growth rule produces is already a whole number of pages on every platform this runs on.
+        debug_assert!(segment.len() / GRAIN <= 1 << OFF_BITS);
+        self.segment_bytes += segment.len();
+        self.segments.push(segment);
         self.seg = narrow(self.segments.len() - 1);
         self.off = 0;
         Ok(())
@@ -425,16 +466,45 @@ impl Arena {
         self.dead
     }
 
-    /// Every byte this arena has taken from the operating system, including its own bookkeeping.
+    /// Every byte this arena is being charged for, including its own bookkeeping.
     ///
     /// This is the number the memory gate is measured against, so it counts the segment list, the free list heads and the oversized table as well as the segments themselves. An accounting that flattered itself by omitting its own overhead would be measuring the wrong thing.
+    ///
+    /// Where segments are mappings it counts the pages of them that have been written to rather than the whole of the newest one, because a page nobody has touched is not in the resident set and counting it would overstate the cache by the size of its reserve. Every segment but the newest is counted whole: an abandoned tail may never have been written to, but tails are shorter than one allocation each and pretending to know which pages they fell on would be a precision this does not have. The error is in the direction of reporting too much.
+    ///
+    /// [`Arena::mapped_bytes`] is the same figure without that distinction.
     #[must_use]
     pub fn resident_bytes(&self) -> usize {
-        let tables = self.segments.capacity() * size_of::<Box<[u8]>>()
+        self.held() + self.large_live + self.tables()
+    }
+
+    /// Every byte of address space this arena holds, including its own bookkeeping.
+    ///
+    /// The same as [`Arena::resident_bytes`] except that the reserve is counted, so on a platform where the reserve is real the two are equal. The difference between them is what a process shows in `VSZ` and not in `RSS`, which is worth being able to name rather than leaving somebody to discover it in `top`.
+    #[must_use]
+    pub fn mapped_bytes(&self) -> usize {
+        self.segment_bytes + self.large_live + self.tables()
+    }
+
+    /// Bytes of segment that are being charged for.
+    fn held(&self) -> usize {
+        if !segment::LAZY {
+            return self.segment_bytes;
+        }
+        // `seg` always names the last segment: growing appends and nothing ever cuts from an earlier one again.
+        let Some(last) = self.segments.last() else {
+            return 0;
+        };
+        let written = (self.off as usize * GRAIN).next_multiple_of(segment::granule());
+        self.segment_bytes - last.len() + written.min(last.len())
+    }
+
+    /// What this arena's own lists cost.
+    fn tables(&self) -> usize {
+        self.segments.capacity() * size_of::<Segment>()
             + self.large.capacity() * size_of::<Box<[u8]>>()
             + self.large_free.capacity() * size_of::<u32>()
-            + self.free.capacity() * size_of::<u32>();
-        self.segment_bytes + self.large_live + tables
+            + self.free.capacity() * size_of::<u32>()
     }
 }
 
@@ -463,22 +533,23 @@ mod tests {
     }
 
     #[test]
-    fn a_segment_is_a_sixteenth_of_what_is_already_there() {
+    fn a_segment_is_a_growth_of_what_is_already_there() {
+        // Written against [`GROWTH`] rather than against a number, because the rule is a doubling where a segment is a mapping and a sixteenth where it is not, and this has to be the same test on both.
         assert_eq!(next_segment_size(0), MIN_SEGMENT, "the first segment");
         assert_eq!(
             next_segment_size(MIN_SEGMENT),
             MIN_SEGMENT,
-            "an eighth of one segment still rounds up to one segment"
+            "a growth of one segment is one segment"
         );
         assert_eq!(
             next_segment_size(GROWTH * MIN_SEGMENT),
             MIN_SEGMENT,
-            "a sixteenth of sixteen segments is one, exactly at the rounding boundary"
+            "exactly at the rounding boundary"
         );
         assert_eq!(
-            next_segment_size(64 * GROWTH * MIN_SEGMENT),
-            64 * MIN_SEGMENT,
-            "a sixteenth, once a sixteenth is worth having"
+            next_segment_size(4 * GROWTH * MIN_SEGMENT),
+            4 * MIN_SEGMENT,
+            "a growth, once a growth is worth having and before the ceiling"
         );
         assert_eq!(
             next_segment_size(usize::MAX),
@@ -634,17 +705,54 @@ mod tests {
     fn a_free_list_link_survives_crossing_segments() {
         // The link is stored inside the freed block, so a free list spanning several segments is the case where a mistaken segment number would corrupt it.
         let mut arena = Arena::new();
-        let taken: Vec<Ref> = (0..50_000).map(|_| arena.alloc(64).unwrap()).collect();
+        // Enough to fill four segments and start a fifth under either growth rule: doubling reaches sixteen times the first segment in four steps, and a sixteenth reaches it in far more.
+        let count = 16 * MIN_SEGMENT / 64;
+        let taken: Vec<Ref> = (0..count).map(|_| arena.alloc(64).unwrap()).collect();
         let segments: std::collections::BTreeSet<usize> =
             taken.iter().map(|at| Arena::place(*at).0).collect();
         assert!(segments.len() > 4, "the test did not span enough segments");
         for at in &taken {
             arena.free(*at, 64);
         }
-        let mut again: Vec<Ref> = (0..50_000).map(|_| arena.alloc(64).unwrap()).collect();
+        let mut again: Vec<Ref> = (0..count).map(|_| arena.alloc(64).unwrap()).collect();
         again.sort_unstable();
         again.dedup();
-        assert_eq!(again.len(), 50_000);
+        assert_eq!(again.len(), count);
+    }
+
+    #[test]
+    fn the_reserve_is_the_difference_between_the_two_totals() {
+        // One allocation into a fresh segment. Everything after the first grain of it is reserve, so this is the widest the two numbers ever get apart, and which of them the allocation is charged to is the whole of what this change was about.
+        let mut arena = Arena::new();
+        let _ = arena.alloc(64);
+        let resident = arena.resident_bytes();
+        let mapped = arena.mapped_bytes();
+        assert!(
+            resident <= mapped,
+            "{resident} charged against {mapped} held"
+        );
+        assert!(mapped >= MIN_SEGMENT, "a segment was not taken");
+        if LAZY_RESERVE {
+            assert!(
+                resident < mapped,
+                "a reserve that is address space was charged as memory"
+            );
+            assert!(
+                resident <= granule() + tables_of(&arena),
+                "{resident} charged for one allocation, against a page of {}",
+                granule()
+            );
+        } else {
+            assert_eq!(
+                resident, mapped,
+                "a reserve that is memory was not charged as memory"
+            );
+        }
+    }
+
+    /// What an arena's own lists cost, so a test can subtract them.
+    fn tables_of(arena: &Arena) -> usize {
+        arena.mapped_bytes() - arena.segment_bytes
     }
 
     #[test]

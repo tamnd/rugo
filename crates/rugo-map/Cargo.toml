@@ -21,6 +21,8 @@ loom.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true
+# The memory test's thresholds are written against the arena's own constants, so that moving one means restating the other.
+rugo-arena.workspace = true
 
 [[bench]]
 name = "map"

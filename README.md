@@ -12,7 +12,7 @@ Twice the throughput of any comparable server, and half the memory per entry.
 
 That is a hard target and it is stated as one. Whether it is met is a measurement, and the measurement lives in [SCOREBOARD.md](SCOREBOARD.md), which is generated from measurement files committed alongside it and checked on every push so a ratio cannot be typed in by hand.
 
-**As of the first measurement it says: memory measured, throughput not.** On overhead per entry rugo is smaller than Garnet, memcached, Redis, Valkey and pogocache by more than the factor of two the gate asks for, and smaller than Dragonfly and yo by less than it. No throughput sweep has run, so half the gate has no row at all rather than a row that guesses.
+**As of the second measurement it says: memory measured, throughput not.** On overhead per entry rugo is smaller than Garnet, memcached, Redis, Valkey, pogocache and yo by more than the factor of two the gate asks for, and smaller than Dragonfly by less than it. Two memory sweeps are published rather than one, a day apart on the same host, because the second is the first with the arena's reserve moved out of resident memory and the gap between them is what that was worth. No throughput sweep has run, so half the gate has no row at all rather than a row that guesses.
 
 The numbers come from [tamnd/cache-bench](https://github.com/tamnd/cache-bench) driving `memtier_benchmark` on named hosts, against memcached, Redis, Valkey, Dragonfly, Garnet, pogocache and yo. Nothing measured on a laptop goes in: two runs of identical code on the development machine here disagreed by 198 percent, which is not a measurement.
 

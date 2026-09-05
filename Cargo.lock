@@ -462,6 +462,9 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 [[package]]
 name = "rugo"
 version = "0.1.0"
+dependencies = [
+ "rugo-server",
+]
 
 [[package]]
 name = "rugo-arena"
@@ -495,6 +498,11 @@ version = "0.1.0"
 [[package]]
 name = "rugo-server"
 version = "0.1.0"
+dependencies = [
+ "rugo-map",
+ "rugo-net",
+ "rugo-resp",
+]
 
 [[package]]
 name = "rustversion"

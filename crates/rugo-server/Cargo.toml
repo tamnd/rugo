@@ -1,6 +1,6 @@
 [package]
 name = "rugo-server"
-description = "placeholder"
+description = "The rugo cache server: listeners, threads, and the command set."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -11,6 +11,11 @@ readme.workspace = true
 keywords.workspace = true
 categories.workspace = true
 publish.workspace = true
+
+[dependencies]
+rugo-map.workspace = true
+rugo-net.workspace = true
+rugo-resp.workspace = true
 
 [lints]
 workspace = true

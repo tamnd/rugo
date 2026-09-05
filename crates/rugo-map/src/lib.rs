@@ -230,6 +230,92 @@ impl Map {
         })
     }
 
+    /// Store `value` under `key` only if the key's presence and the expiry rule allow it.
+    ///
+    /// What `SET` with `NX`, `XX` or `KEEPTTL` needs, and the reason it is here rather than assembled by the caller: the condition and the write have to happen under one lock or the condition is only a guess about what was true a moment ago.
+    ///
+    /// `Ok(None)` means the condition refused, which is not an error. Plain [`Map::set`] stays separate rather than calling this, because the condition costs a lookup the unconditional path should not pay.
+    ///
+    /// # Errors
+    ///
+    /// [`Full`] when the shard cannot take the entry.
+    pub fn set_when(
+        &self,
+        key: &[u8],
+        value: &[u8],
+        when: When,
+        expiry: Expiry,
+        user_flags: Option<u32>,
+    ) -> Result<Option<Wrote>, Full> {
+        let hash = self.hash(key);
+        let budget = self.shard_budget;
+        self.with_key(hash, |table, now| {
+            let held = table.view(key, hash, now).map(|view| view.expiry);
+            match (when, held.is_some()) {
+                (When::Absent, true) | (When::Present, false) => return Ok(None),
+                _ => {}
+            }
+            let expiry = match expiry {
+                Expiry::At(when) => Some(when),
+                Expiry::Never => None,
+                Expiry::Keep => held.flatten(),
+            };
+            let wrote = table.set(key, value, hash, expiry, user_flags)?;
+            evict_to_fit(table, budget, hash);
+            Ok(Some(wrote))
+        })
+    }
+
+    /// Change when `key` expires, reporting whether it was there to change.
+    ///
+    /// `None` clears the expiry, which is what `PERSIST` asks for.
+    ///
+    /// # Errors
+    ///
+    /// [`Full`] when giving a key an expiry it did not have needs four more bytes than the shard can find. The key keeps what it had.
+    pub fn expire(&self, key: &[u8], expiry: Option<u32>) -> Result<bool, Full> {
+        let hash = self.hash(key);
+        self.with_key(hash, |table, now| table.expire(key, hash, expiry, now))
+    }
+
+    /// When `key` expires: the outer `None` if there is no such key, the inner one if it has no expiry.
+    pub fn deadline(&self, key: &[u8]) -> Option<Option<u32>> {
+        self.view(key, |view| view.expiry)
+    }
+
+    /// Add `by` to the decimal integer under `key`, taking a missing key as nought, and return what it now holds.
+    ///
+    /// One lock for the read and the write, which is the whole reason this is here rather than assembled out of [`Map::get`] and [`Map::set`] by the caller: two calls would let another thread's increment land in between and be lost.
+    ///
+    /// The key keeps whatever expiry and user flags it had, because Redis's `INCR` is a write to the value and not a new key.
+    ///
+    /// # Errors
+    ///
+    /// [`Uncounted`], saying which of the three ways it did not happen.
+    pub fn increment(&self, key: &[u8], by: i64) -> Result<i64, Uncounted> {
+        let hash = self.hash(key);
+        let budget = self.shard_budget;
+        self.with_key(hash, |table, now| {
+            let (current, expiry, user_flags) = match table.view(key, hash, now) {
+                Some(view) => (
+                    decimal(view.value).ok_or(Uncounted::NotANumber)?,
+                    view.expiry,
+                    view.user_flags,
+                ),
+                None => (0, None, None),
+            };
+            let next = current.checked_add(by).ok_or(Uncounted::OutOfRange)?;
+
+            let mut text = [0u8; 20];
+            let wrote = digits(&mut text, next);
+            table
+                .set(key, &text[..wrote], hash, expiry, user_flags)
+                .map_err(|_| Uncounted::Full)?;
+            evict_to_fit(table, budget, hash);
+            Ok(next)
+        })
+    }
+
     /// Remove `key`, reporting whether it was there.
     pub fn remove(&self, key: &[u8]) -> bool {
         let hash = self.hash(key);
@@ -331,6 +417,107 @@ impl Map {
     pub const fn maxmemory(&self) -> usize {
         self.maxmemory
     }
+}
+
+/// What a conditional write asks about the key it is about to overwrite.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum When {
+    /// Write regardless, which is what a plain `SET` does.
+    #[default]
+    Always,
+    /// Write only if the key is not there, which is `NX`.
+    Absent,
+    /// Write only if it is, which is `XX`.
+    Present,
+}
+
+/// What a write does about the expiry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Expiry {
+    /// Expire at this second since the Unix epoch.
+    At(u32),
+    /// Never, which is what a `SET` with no expiry option means: it clears whatever was there.
+    #[default]
+    Never,
+    /// Whatever the key already had, which is `KEEPTTL`.
+    Keep,
+}
+
+/// Why an increment did not happen.
+///
+/// Three ways rather than one, because a client can act on the difference: a value that is not a number is the caller's mistake, a result out of range is the caller's arithmetic, and a full shard is the server's problem.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Uncounted {
+    /// The key holds something that is not a decimal integer.
+    NotANumber,
+    /// The answer does not fit in a signed sixty-four bit integer.
+    OutOfRange,
+    /// The shard could not take the new value.
+    Full,
+}
+
+impl core::fmt::Display for Uncounted {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Self::NotANumber => "value is not an integer or out of range",
+            Self::OutOfRange => "increment or decrement would overflow",
+            Self::Full => "out of memory",
+        })
+    }
+}
+
+impl core::error::Error for Uncounted {}
+
+/// Read a decimal integer, exactly as strictly as Redis reads one.
+///
+/// Leading zeros, leading spaces, a lone minus sign and a trailing anything are all refused, because a cache that answered `INCR` on `"007"` would be a cache whose stored value and whose arithmetic disagreed about what the value was.
+fn decimal(text: &[u8]) -> Option<i64> {
+    // Nineteen digits and a sign is the widest an `i64` gets, and a longer run cannot be one however it reads.
+    if text.is_empty() || text.len() > 20 {
+        return None;
+    }
+    let (negative, digits) = match text {
+        [b'-', rest @ ..] => (true, rest),
+        rest => (false, rest),
+    };
+    // A nought may only stand alone and may not be signed, so that `0` has exactly one spelling and `INCR` on a value it did not write is never a possibility.
+    if digits.is_empty() || (digits[0] == b'0' && (negative || digits.len() > 1)) {
+        return None;
+    }
+
+    let mut value = 0i64;
+    for &byte in digits {
+        let digit = byte.checked_sub(b'0').filter(|d| *d < 10)?;
+        value = value.checked_mul(10)?.checked_sub(i64::from(digit))?;
+    }
+    // Accumulated negative throughout, so that the most negative integer, which has no positive counterpart, parses like any other.
+    if negative {
+        Some(value)
+    } else {
+        value.checked_neg()
+    }
+}
+
+/// Write `value` as decimal at the front of `into`, returning how many bytes it took.
+fn digits(into: &mut [u8; 20], value: i64) -> usize {
+    let mut buf = [0u8; 20];
+    let mut at = buf.len();
+    let mut left = value.unsigned_abs();
+    loop {
+        at -= 1;
+        buf[at] = b'0' + u8::try_from(left % 10).unwrap_or(0);
+        left /= 10;
+        if left == 0 {
+            break;
+        }
+    }
+    if value < 0 {
+        at -= 1;
+        buf[at] = b'-';
+    }
+    let len = buf.len() - at;
+    into[..len].copy_from_slice(&buf[at..]);
+    len
 }
 
 /// Evict from `table` until it fits in `budget`, seeding the sampler from `hash`.
@@ -604,6 +791,125 @@ mod tests {
         for thread in threads {
             thread.join().unwrap();
         }
+    }
+
+    #[test]
+    fn a_decimal_reads_the_way_redis_reads_one() {
+        assert_eq!(decimal(b"0"), Some(0));
+        assert_eq!(decimal(b"-1"), Some(-1));
+        assert_eq!(decimal(b"9223372036854775807"), Some(i64::MAX));
+        // The most negative integer has no positive counterpart, which is why the parser accumulates negative rather than negating at the end.
+        assert_eq!(decimal(b"-9223372036854775808"), Some(i64::MIN));
+        assert_eq!(decimal(b"9223372036854775808"), None);
+        for text in [
+            &b""[..],
+            b"-",
+            b"007",
+            b" 1",
+            b"1 ",
+            b"1.0",
+            b"+1",
+            b"one",
+            b"-0",
+        ] {
+            assert_eq!(decimal(text), None, "{text:?} was read as a number");
+        }
+    }
+
+    #[test]
+    fn every_number_written_reads_back() {
+        for value in [0i64, 1, -1, 9, 10, -10, 999, i64::MAX, i64::MIN] {
+            let mut text = [0u8; 20];
+            let wrote = digits(&mut text, value);
+            assert_eq!(
+                decimal(&text[..wrote]),
+                Some(value),
+                "{value} did not round trip"
+            );
+        }
+    }
+
+    #[test]
+    fn a_counter_starts_at_nought_and_keeps_its_expiry() {
+        let map = map();
+        assert_eq!(map.increment(b"hits", 1), Ok(1));
+        assert_eq!(map.increment(b"hits", 41), Ok(42));
+        assert_eq!(map.increment(b"hits", -42), Ok(0));
+        assert_eq!(get(&map, b"hits").as_deref(), Some(&b"0"[..]));
+
+        map.set(b"ttl", b"5", Some(map.clock().now() + 60), None)
+            .unwrap();
+        assert_eq!(map.increment(b"ttl", 1), Ok(6));
+        assert!(
+            map.deadline(b"ttl").flatten().is_some(),
+            "incrementing a key threw away its expiry"
+        );
+    }
+
+    #[test]
+    fn a_counter_refuses_what_it_cannot_count() {
+        let map = map();
+        map.set(b"word", b"hello", None, None).unwrap();
+        assert_eq!(map.increment(b"word", 1), Err(Uncounted::NotANumber));
+        assert_eq!(get(&map, b"word").as_deref(), Some(&b"hello"[..]));
+
+        let mut text = [0u8; 20];
+        let wrote = digits(&mut text, i64::MAX);
+        map.set(b"big", &text[..wrote], None, None).unwrap();
+        assert_eq!(map.increment(b"big", 1), Err(Uncounted::OutOfRange));
+    }
+
+    #[test]
+    fn an_expiry_can_be_given_changed_and_taken_away() {
+        let map = map();
+        let now = map.clock().now();
+        map.set(b"k", b"v", None, None).unwrap();
+
+        assert_eq!(map.deadline(b"k"), Some(None));
+        assert_eq!(map.deadline(b"absent"), None);
+
+        // Given to a key that had none, which is the case that has to rewrite the entry wider.
+        assert_eq!(map.expire(b"k", Some(now + 60)), Ok(true));
+        assert_eq!(map.deadline(b"k"), Some(Some(now + 60)));
+        assert_eq!(get(&map, b"k").as_deref(), Some(&b"v"[..]));
+
+        // Changed, which is four bytes over four bytes and nothing else.
+        assert_eq!(map.expire(b"k", Some(now + 120)), Ok(true));
+        assert_eq!(map.deadline(b"k"), Some(Some(now + 120)));
+
+        // Taken away, which rewrites it narrower again.
+        assert_eq!(map.expire(b"k", None), Ok(true));
+        assert_eq!(map.deadline(b"k"), Some(None));
+        assert_eq!(get(&map, b"k").as_deref(), Some(&b"v"[..]));
+
+        assert_eq!(map.expire(b"absent", Some(now + 60)), Ok(false));
+    }
+
+    #[test]
+    fn an_expiry_in_the_past_takes_the_key_with_it() {
+        let map = map();
+        map.set(b"k", b"v", None, None).unwrap();
+        let now = map.clock().now();
+        assert_eq!(map.expire(b"k", Some(now)), Ok(true));
+        // Set to expire at this very second, which the map reads as gone, so the next read of it is a miss and the entry goes back to the arena.
+        assert_eq!(get(&map, b"k"), None);
+        assert_eq!(map.expire(b"k", None), Ok(false));
+    }
+
+    #[test]
+    fn an_expiry_survives_the_entry_being_moved() {
+        // A rewrite at a new width takes a new block, and a key whose user flags did not come with it would be a key silently stripped of them.
+        let map = map();
+        let now = map.clock().now();
+        map.set(b"k", b"v", None, Some(0xdead_beef)).unwrap();
+        assert_eq!(map.expire(b"k", Some(now + 60)), Ok(true));
+        let view = map.view(b"k", |view| {
+            (view.value.to_vec(), view.expiry, view.user_flags)
+        });
+        assert_eq!(
+            view,
+            Some((b"v".to_vec(), Some(now + 60), Some(0xdead_beef)))
+        );
     }
 
     #[test]

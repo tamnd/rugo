@@ -184,8 +184,8 @@ mod imp {
         pub(crate) fn match_byte(self, byte: u8) -> BitMask {
             // SAFETY: both intrinsics are unconditionally available under target_feature = "sse2", which this module is gated on.
             unsafe {
-                let cmp = sse::_mm_cmpeq_epi8(self.0, sse::_mm_set1_epi8(byte as i8));
-                BitMask(sse::_mm_movemask_epi8(cmp) as u32 as u64)
+                let cmp = sse::_mm_cmpeq_epi8(self.0, sse::_mm_set1_epi8(byte.cast_signed()));
+                BitMask(u64::from(sse::_mm_movemask_epi8(cmp).cast_unsigned()))
             }
         }
 
@@ -201,7 +201,9 @@ mod imp {
         #[inline]
         pub(crate) fn match_free(self) -> BitMask {
             // SAFETY: available under target_feature = "sse2".
-            BitMask(unsafe { sse::_mm_movemask_epi8(self.0) as u32 as u64 })
+            BitMask(u64::from(
+                unsafe { sse::_mm_movemask_epi8(self.0) }.cast_unsigned(),
+            ))
         }
     }
 }

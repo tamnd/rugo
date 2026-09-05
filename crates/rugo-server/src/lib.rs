@@ -1,1 +1,458 @@
-//! placeholder
+//! The server: listeners, threads, and the loop between them.
+//!
+//! # Shape
+//!
+//! One thread a core, each with its own poller and its own connections, all sharing one [`rugo_map::Map`] and one set of listeners. A connection belongs to whichever thread accepted it for as long as it lives, so nothing about a connection is shared and nothing about it needs a lock. The only thing threads contend for is a shard of the map, and there are thousands of those.
+//!
+//! # The listener
+//!
+//! One listening socket, registered in every thread's poller. When a connection arrives every thread wakes and one of them wins the accept; the rest get `WouldBlock` and go back to sleep. That is a thundering herd, and it is the right trade here: it costs a wakeup a connection, and a benchmark opens its connections once and then sends a hundred million commands down them.
+//!
+//! `SO_REUSEPORT` with a listener a thread would remove the herd and is what [`rugo_net::share_port`] is there for. It is not done yet because it would buy nothing measurable and would cost a real complication: the kernel's balancing is by hash rather than by load, and a bad split is worse than a wakeup.
+//!
+//! # The loop
+//!
+//! Level-triggered, one read a readiness event, no timers except a poll timeout that gives the clock a tick and the map a sweep. Everything a connection does is in [`conn`], and everything a command does is in [`dispatch`].
+
+pub mod config;
+mod conn;
+mod dispatch;
+mod stats;
+
+use std::io;
+use std::net::{Ipv4Addr, TcpListener};
+use std::os::fd::{AsRawFd, RawFd};
+use std::os::unix::net::UnixListener;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use rugo_map::Map;
+use rugo_net::{Interest, Poller, Ready};
+
+pub use config::{Asked, Config, USAGE, Uring};
+pub use stats::{Stats, Total};
+
+use conn::{Conn, Stream, Turn};
+use dispatch::Env;
+
+/// How long a poll waits when nothing is happening.
+///
+/// Short enough that the clock a hundred milliseconds of expiry is measured against is never far wrong, and long enough that an idle server with thirty-two threads wakes three hundred times a second in total rather than thirty thousand.
+const IDLE: Duration = Duration::from_millis(100);
+
+/// How many slots a background sweep looks at each idle turn.
+///
+/// Expiry is already checked on read, so this is only what reclaims a key nobody asks for again. Small, because it takes a shard's lock to do it.
+const SWEEP: usize = 256;
+
+/// A listening socket, whichever kind it is.
+#[derive(Debug)]
+enum Listener {
+    /// A TCP listener.
+    Tcp(TcpListener),
+    /// A unix socket listener.
+    Unix(UnixListener),
+}
+
+impl Listener {
+    /// Take a connection, if one is waiting.
+    fn accept(&self) -> io::Result<Option<Stream>> {
+        let taken = match self {
+            Self::Tcp(listener) => listener.accept().map(|(stream, _)| Stream::Tcp(stream)),
+            Self::Unix(listener) => listener.accept().map(|(stream, _)| Stream::Unix(stream)),
+        };
+        match taken {
+            Ok(stream) => Ok(Some(stream)),
+            // Another thread won the race for this connection, which is ordinary and not worth reporting.
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+}
+
+impl AsRawFd for Listener {
+    fn as_raw_fd(&self) -> RawFd {
+        match self {
+            Self::Tcp(listener) => listener.as_raw_fd(),
+            Self::Unix(listener) => listener.as_raw_fd(),
+        }
+    }
+}
+
+/// A running server.
+#[derive(Debug)]
+pub struct Server {
+    /// How it was configured.
+    config: Config,
+    /// The cache.
+    map: Arc<Map>,
+    /// What it counts.
+    stats: Arc<Stats>,
+    /// The sockets it listens on.
+    listeners: Arc<Vec<Listener>>,
+    /// When it started, for `INFO`.
+    started: Instant,
+}
+
+impl Server {
+    /// Bind everything `config` asks for, without serving any of it yet.
+    ///
+    /// Binding here rather than inside the threads is what makes a port already in use an error the caller can report and exit on, rather than a thread that dies quietly behind a process that looks healthy.
+    ///
+    /// # Errors
+    ///
+    /// Whatever binding failed with, which is almost always an address in use or a socket path that cannot be written.
+    pub fn new(config: Config) -> io::Result<Self> {
+        let mut listeners = Vec::new();
+
+        if let Some(port) = config.port {
+            // Loopback and every interface, in one socket: `Ipv6Addr::UNSPECIFIED` would need the dual-stack option set and would still fail where IPv6 is off, and a benchmark that could not connect over IPv4 is a benchmark that does not run.
+            let listener = TcpListener::bind((Ipv4Addr::UNSPECIFIED, port))?;
+            listener.set_nonblocking(true)?;
+            listeners.push(Listener::Tcp(listener));
+        }
+
+        if let Some(path) = &config.unixsocket {
+            // A socket left behind by a process that was killed rather than stopped, which is what a benchmark harness does to every server it runs. Removing it is the only way to bind the same path twice, and refusing to would make the second run of a sweep fail.
+            let _ = std::fs::remove_file(path);
+            let listener = UnixListener::bind(path)?;
+            listener.set_nonblocking(true)?;
+            listeners.push(Listener::Unix(listener));
+        }
+
+        Ok(Self {
+            map: Arc::new(Map::new(config.shards, config.maxmemory)),
+            stats: Arc::new(Stats::new(config.threads)),
+            listeners: Arc::new(listeners),
+            started: Instant::now(),
+            config,
+        })
+    }
+
+    /// The address the TCP listener actually got.
+    ///
+    /// Not the configured port, because a port of nought is a request for whichever one is free, and a test that wants to connect has to be told which that was.
+    ///
+    /// # Errors
+    ///
+    /// Whatever asking the socket failed with.
+    pub fn port(&self) -> io::Result<Option<u16>> {
+        for listener in self.listeners.iter() {
+            if let Listener::Tcp(listener) = listener {
+                return listener.local_addr().map(|at| Some(at.port()));
+            }
+        }
+        Ok(None)
+    }
+
+    /// What the server has counted so far.
+    #[must_use]
+    pub fn stats(&self) -> &Stats {
+        &self.stats
+    }
+
+    /// Serve until the process is stopped.
+    ///
+    /// Starts every thread but the first, then serves on the calling thread, so a server with one thread makes no threads at all and a `SIGTERM` arrives at a process that is doing the work rather than waiting on a join.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the calling thread's loop failed with, which is a poller that could not be created or a syscall that failed in a way this cannot continue past.
+    pub fn run(&self) -> io::Result<()> {
+        std::thread::scope(|scope| {
+            for thread in 1..self.config.threads {
+                let worker = Worker {
+                    thread,
+                    map: &self.map,
+                    stats: &self.stats,
+                    listeners: &self.listeners,
+                    config: &self.config,
+                    started: self.started,
+                };
+                std::thread::Builder::new()
+                    .name(format!("rugo-{thread}"))
+                    .spawn_scoped(scope, move || {
+                        if let Err(error) = worker.serve() {
+                            // One thread failing is not the others failing, and a server that went on serving on the rest without saying so would be a server quietly running at a fraction of its threads.
+                            eprintln!("rugo: thread {thread} stopped: {error}");
+                        }
+                    })?;
+            }
+
+            Worker {
+                thread: 0,
+                map: &self.map,
+                stats: &self.stats,
+                listeners: &self.listeners,
+                config: &self.config,
+                started: self.started,
+            }
+            .serve()
+        })
+    }
+}
+
+impl Drop for Server {
+    fn drop(&mut self) {
+        // The socket file outlives the process that made it, and a stale one is what the next run has to clear before it can bind. Removing it here means only a killed process leaves one behind.
+        if let Some(path) = &self.config.unixsocket {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+/// One serving thread.
+#[derive(Debug)]
+struct Worker<'a> {
+    /// Which thread this is, and so which counters are its own.
+    thread: usize,
+    /// The shared cache.
+    map: &'a Map,
+    /// Every thread's counters.
+    stats: &'a Stats,
+    /// The shared listeners.
+    listeners: &'a [Listener],
+    /// How the server was configured.
+    config: &'a Config,
+    /// When the server started.
+    started: Instant,
+}
+
+impl Worker<'_> {
+    /// Serve until something fails.
+    fn serve(&self) -> io::Result<()> {
+        let mut poller = Poller::new()?;
+        for (at, listener) in self.listeners.iter().enumerate() {
+            poller.add(
+                listener.as_raw_fd(),
+                u64::try_from(at).unwrap_or(u64::MAX),
+                Interest::READ,
+            )?;
+        }
+
+        let env = Env {
+            map: self.map,
+            stats: self.stats,
+            thread: self.thread,
+            started: self.started,
+            config: self.config,
+        };
+
+        // Indexed by the token a connection was registered under, minus the listeners' share of the numbering. A vector with holes rather than a map, because a token is already an index and looking one up should not be a hash.
+        let mut conns: Vec<Option<Conn>> = Vec::new();
+        let mut free: Vec<usize> = Vec::new();
+        // The events, copied out of the poller so that handling one may register another.
+        let mut ready: Vec<Ready> = Vec::new();
+
+        loop {
+            ready.clear();
+            ready.extend_from_slice(poller.wait(Some(IDLE))?);
+
+            for event in &ready {
+                // The tokens are this loop's own doing: a listener's index, then a connection's slot. Nothing on the wire chooses one, so a token that does not fit a machine word is a bug here rather than something a client did.
+                let Ok(token) = usize::try_from(event.token) else {
+                    continue;
+                };
+                if token < self.listeners.len() {
+                    self.take(&self.listeners[token], &poller, &mut conns, &mut free)?;
+                    continue;
+                }
+
+                let at = token - self.listeners.len();
+                let Some(Some(conn)) = conns.get_mut(at) else {
+                    continue;
+                };
+
+                let turn = if event.gone {
+                    Turn::Close
+                } else {
+                    conn.turn(&env, event.read, event.write)
+                };
+                match turn {
+                    Turn::Read | Turn::Write => {
+                        let want = Interest {
+                            read: true,
+                            write: turn == Turn::Write,
+                        };
+                        // Re-registered every turn rather than only when it changed, because a `modify` is a syscall on a descriptor this thread owns and tracking the last interest to avoid it would be state that can go wrong.
+                        poller.modify(conn.fd(), event.token, want)?;
+                    }
+                    Turn::Close => {
+                        let _ = poller.remove(conn.fd());
+                        conns[at] = None;
+                        free.push(at);
+                    }
+                }
+            }
+
+            // Whether or not anything happened. The clock is what every expiry is measured against, and a thread that only ticked it when it was busy would leave an idle server's keys immortal.
+            self.map.clock().tick();
+            self.map.sweep(SWEEP);
+        }
+    }
+
+    /// Take every connection waiting on `listener`.
+    ///
+    /// Accepting until it blocks rather than once, because every thread was woken for this and only one of them will get anything, and the ones that got nothing have already paid for the wakeup.
+    fn take(
+        &self,
+        listener: &Listener,
+        poller: &Poller,
+        conns: &mut Vec<Option<Conn>>,
+        free: &mut Vec<usize>,
+    ) -> io::Result<()> {
+        while let Some(stream) = listener.accept()? {
+            if stream.prepare().is_err() {
+                continue;
+            }
+            let conn = Conn::new(stream);
+            let fd = conn.fd();
+
+            let at = if let Some(at) = free.pop() {
+                conns[at] = Some(conn);
+                at
+            } else {
+                conns.push(Some(conn));
+                conns.len() - 1
+            };
+
+            let token = u64::try_from(at + self.listeners.len()).unwrap_or(u64::MAX);
+            if let Err(error) = poller.add(fd, token, Interest::READ) {
+                conns[at] = None;
+                free.push(at);
+                return Err(error);
+            }
+            self.stats.thread(self.thread).connection();
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpStream;
+    use std::os::unix::net::UnixStream;
+
+    use super::*;
+
+    /// A server on a port the operating system chose, and the port it chose.
+    ///
+    /// Left running for the rest of the process: there is no stop, because nothing in the serving path checks for one, and a test that wants a fresh server asks for another port rather than reclaiming this one.
+    fn serving(threads: usize) -> u16 {
+        let config = Config {
+            threads,
+            // Nought is a request for whichever port is free, which is what lets these tests run beside each other and beside anything else on the machine.
+            port: Some(0),
+            unixsocket: None,
+            ..Config::default()
+        };
+        let server = Server::new(config).expect("the server bound");
+        let port = server.port().expect("a local address").expect("a port");
+        std::thread::spawn(move || {
+            let _ = server.run();
+        });
+
+        // Wait for it to be answering rather than merely bound, which is what the harness's readiness probe does and for the same reason.
+        for _ in 0..200 {
+            if let Ok(mut client) = TcpStream::connect((Ipv4Addr::LOCALHOST, port))
+                && client.write_all(b"PING\r\n").is_ok()
+            {
+                let mut line = String::new();
+                if BufReader::new(&mut client).read_line(&mut line).is_ok() && line == "+PONG\r\n" {
+                    return port;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("the server never answered on port {port}");
+    }
+
+    /// Send `input` to a server and read `lines` lines back.
+    fn talk(port: u16, input: &[u8], lines: usize) -> Vec<String> {
+        let mut client = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).expect("connected");
+        client.set_nodelay(true).expect("nodelay");
+        client.write_all(input).expect("wrote");
+        let mut reader = BufReader::new(client);
+        (0..lines)
+            .map(|_| {
+                let mut line = String::new();
+                reader.read_line(&mut line).expect("read a line");
+                line
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_client_can_set_and_get_over_tcp() {
+        let port = serving(1);
+        let back = talk(
+            port,
+            b"*3\r\n$3\r\nSET\r\n$5\r\nhello\r\n$5\r\nworld\r\n*2\r\n$3\r\nGET\r\n$5\r\nhello\r\n",
+            3,
+        );
+        assert_eq!(back, ["+OK\r\n", "$5\r\n", "world\r\n"]);
+    }
+
+    #[test]
+    fn several_threads_share_one_map() {
+        // The claim that makes the whole shape worth having: a key written on whichever thread took one connection is readable on whichever took another.
+        let port = serving(4);
+        for n in 0..32 {
+            let set = format!("*3\r\n$3\r\nSET\r\n$4\r\nk{n:03}\r\n$4\r\nv{n:03}\r\n");
+            assert_eq!(talk(port, set.as_bytes(), 1), ["+OK\r\n"]);
+        }
+        for n in 0..32 {
+            let get = format!("*2\r\n$3\r\nGET\r\n$4\r\nk{n:03}\r\n");
+            assert_eq!(
+                talk(port, get.as_bytes(), 2),
+                ["$4\r\n".to_owned(), format!("v{n:03}\r\n")],
+                "key k{n:03} was written on one thread and lost on another"
+            );
+        }
+    }
+
+    #[test]
+    fn a_unix_socket_serves_the_same_thing() {
+        let path = std::env::temp_dir().join(format!("rugo-test-{}.sock", std::process::id()));
+        let config = Config {
+            threads: 1,
+            port: None,
+            unixsocket: Some(path.display().to_string()),
+            ..Config::default()
+        };
+        let server = Server::new(config).expect("the server bound");
+        std::thread::spawn(move || {
+            let _ = server.run();
+        });
+
+        let mut client = None;
+        for _ in 0..200 {
+            if let Ok(stream) = UnixStream::connect(&path) {
+                client = Some(stream);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let mut client = client.expect("the socket never appeared");
+        client.write_all(b"PING\r\n").expect("wrote");
+        let mut line = String::new();
+        BufReader::new(&mut client)
+            .read_line(&mut line)
+            .expect("read");
+        assert_eq!(line, "+PONG\r\n");
+    }
+
+    #[test]
+    fn a_port_already_taken_is_an_error_rather_than_a_panic() {
+        let port = serving(1);
+        let config = Config {
+            port: Some(port),
+            ..Config::default()
+        };
+        assert!(
+            Server::new(config).is_err(),
+            "two servers bound the same port"
+        );
+    }
+}

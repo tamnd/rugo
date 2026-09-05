@@ -343,6 +343,67 @@ impl Table {
         true
     }
 
+    /// Change when `key` expires, reporting whether the key was there to change.
+    ///
+    /// `None` clears the expiry, which is `PERSIST`. A key found to have already expired is removed and reported absent, the same as any other read of it would do.
+    ///
+    /// # Errors
+    ///
+    /// [`Full`] when the entry has to be rewritten at a new width and the shard cannot take it. The old entry is left alone in that case, so the key keeps the expiry it had rather than losing both.
+    pub fn expire(
+        &mut self,
+        key: &[u8],
+        hash: u64,
+        expiry: Option<u32>,
+        now: u32,
+    ) -> Result<bool, Full> {
+        let Some((at, head)) = self.find(key, hash) else {
+            return Ok(false);
+        };
+        let entry = Ref::from_bits(self.slots[at]);
+        if self.expiry_of(entry, head).is_some_and(|when| when <= now) {
+            self.erase(at);
+            return Ok(false);
+        }
+
+        match (head.flags & entry::HAS_EXPIRY != 0, expiry) {
+            // The field is already there and is the same width either way, so this is four bytes written over four bytes and nothing else moves.
+            (true, Some(when)) => {
+                let size = head.size();
+                let word = head.header + head.klen + head.vlen;
+                self.arena.get_mut(entry, size)[word..word + 4]
+                    .copy_from_slice(&when.to_le_bytes());
+            }
+            // Persisting a key that was never going to expire.
+            (false, None) => {}
+            // The trailer changes width, so the entry is rewritten somewhere it fits. `EXPIRE` and `PERSIST` are not on any hot path, and paying a copy here is what keeps an entry with no expiry from carrying four bytes of room to grow into.
+            _ => {
+                let old = head.size();
+                let bytes = self.arena.get(entry, old).to_vec();
+                let head = entry::head(&bytes);
+                let user_flags = head.user_flags(&bytes);
+                let size = entry::size_of_entry(
+                    head.klen,
+                    head.vlen,
+                    expiry.is_some(),
+                    user_flags.is_some(),
+                );
+
+                let new = self.arena.alloc(size)?;
+                entry::write(
+                    self.arena.get_mut(new, size),
+                    head.key(&bytes),
+                    head.value(&bytes),
+                    expiry,
+                    user_flags,
+                );
+                self.arena.free(entry, old);
+                self.slots[at] = new.bits();
+            }
+        }
+        Ok(true)
+    }
+
     /// Drop the entry in slot `at`, leaving the slot reusable.
     ///
     /// A slot becomes [`EMPTY`] only when its group already holds an empty lane, because in that case no probe sequence ever ran past this slot and none will now. Otherwise it becomes a tombstone, which later probes have to walk over. Getting this backwards does not make the table slow, it makes unrelated keys unreachable, which is why it is the one place here that tests a condition rather than storing unconditionally.

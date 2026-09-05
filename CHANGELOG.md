@@ -20,8 +20,8 @@ Milestones `M0`, `M1` and `M2`: the workspace, the map and the server. This is t
 
 ### Known gaps
 
-- **No published numbers.** rugo builds, passes its tests and serves, and that is a different claim from being faster than anything. The two bench hosts are not provisioned and rugo is not yet a subject in `cache-bench`.
-- **No memory numbers against a rival.** `cache-bench` measures throughput, latency and CPU cycles and does not measure memory anywhere. Until `cb-mem` lands there, the memory half of the goal is asserted against this project's own design and against nobody else's.
+- **No published numbers.** rugo builds, passes its tests and serves, and that is a different claim from being faster than anything. rugo is now cache-bench's eighth subject and its memory metric exists, but neither bench host is provisioned and no sweep has run.
+- **No memory numbers against a rival.** `cache-bench mem` now measures what an engine costs to hold a known number of keys, so the metric exists; it has not been run against anything. Until it has, the memory half of the goal is asserted against this project's own design and against nobody else's.
 - **`--uring` is accepted and does nothing.** The io_uring backend is `M5`.
 - **One eviction rule and no choice of rule.** Under `--maxmemory` the map draws two entries at random and drops whichever expires sooner, an entry with no expiry counting as expiring last. That is a deliberate trade — a true recency order costs two links an entry, and sixteen bytes of links on a five byte slot would undo the thing this map exists for — but it is one rule where Redis offers eight, and `maxmemory-policy` is not settable. Whether it is the right rule is a question for a sweep.
 - **No authentication and no TLS.** `M6`.

@@ -437,7 +437,7 @@ const NOTHING_YET: &str = "\
 
 `bench/` is empty, so there is nothing to report. rugo builds, passes its tests and serves, and that is a different claim from being faster than anything.
 
-The first sweep lands when rugo is wired into `cache-bench` as its eighth subject and the two bench hosts are provisioned. Until then this document has no numbers in it, which is the honest state rather than an empty table that looks like a result.
+rugo is `cache-bench`'s eighth subject and its memory metric exists, so what is left before the first sweep is provisioning the two bench hosts and running it. Until then this document has no numbers in it, which is the honest state rather than an empty table that looks like a result.
 
 ";
 

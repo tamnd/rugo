@@ -24,7 +24,7 @@
 //!
 //! The part of the newest segment nothing has been written into yet is the arena's reserve, and it was the largest single item of overhead in the cache: seven per cent of everything held, measured on a million hundred byte entries across four thousand shards, against about ten bytes an entry for the index and four for the grain.
 //!
-//! It is now mostly not there. A segment is its own anonymous mapping, so a page of it costs nothing until something is written to it, and the reserve is address space rather than memory. See [`segment`](mod@segment) for which platforms that holds on and what the others do instead. The floor argument above survives it — an untouched mapping is free whatever its size — which is why the growth rule is a doubling again rather than the sixteenth it had to be when the reserve was real.
+//! It is now mostly not there. A segment is its own anonymous mapping, so a page of it costs nothing until something is written to it, and the reserve is address space rather than memory. [`LAZY_RESERVE`] says on which platforms that holds, and `src/segment.rs` says what the others do instead. The floor argument above survives it — an untouched mapping is free whatever its size — which is why the growth rule is a doubling again rather than the sixteenth it had to be when the reserve was real.
 //!
 //! Two numbers come out of that and they are different questions. [`Arena::resident_bytes`] is what the operating system is charging for, which counts the reserve only where the reserve is real. [`Arena::mapped_bytes`] is the address space, which counts all of it. The first is the one the memory claim is made against and the second is the one that explains a surprising `VSZ`.
 //!
@@ -45,7 +45,7 @@ pub const MIN_SEGMENT: usize = if segment::LAZY { 1024 * 1024 } else { 4 * 1024 
 
 /// The largest a segment grows to.
 ///
-/// A cap rather than a target. Eight megabytes is what a twenty bit unit offset can address, so it is also the ceiling the reference width imposes, and at [`MAX_SEGMENTS`] segments it puts sixteen gigabytes in reach of one shard of thousands.
+/// A cap rather than a target. Eight megabytes is what a twenty bit unit offset can address, so it is also the ceiling the reference width imposes, and at the two thousand and forty-eight segments a reference can name it puts sixteen gigabytes in reach of one shard of thousands.
 pub const MAX_SEGMENT: usize = if segment::LAZY {
     8 * 1024 * 1024
 } else {

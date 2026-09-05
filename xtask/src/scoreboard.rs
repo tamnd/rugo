@@ -105,7 +105,7 @@ pub(crate) fn write() -> Result<(), String> {
     Ok(())
 }
 
-/// Fail if the committed `SCOREBOARD.md` is not what [`write`] would produce.
+/// Fail if the committed `SCOREBOARD.md` is not what [`write()`] would produce.
 ///
 /// # Errors
 ///

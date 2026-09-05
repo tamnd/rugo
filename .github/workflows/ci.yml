@@ -69,11 +69,23 @@ jobs:
           sys.exit(1 if bad else 0)
           PY
 
+  # Three operating systems, but not the same scope on all three.
+  #
+  # The server is Unix. Its poller is epoll and kqueue and its listener is a unix socket, and the Windows equivalent is IOCP, which is a different program rather than a port of this one. Windows therefore builds and tests the crates that are portable: the hash, the arena, the map with its SIMD probe, and the parser. Those are where the memory claim and the parsing live and they are worth a third target's opinion.
+  #
+  # The exclusions are named rather than the inclusions so that a crate added later is tested here by default, and only leaves the Windows job if somebody puts it in this list on purpose.
   test:
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
+        include:
+          - os: ubuntu-latest
+            scope: --workspace
+          - os: macos-latest
+            scope: --workspace
+          - os: windows-latest
+            scope: --workspace --exclude rugo --exclude rugo-net --exclude rugo-server
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15
     steps:
@@ -85,10 +97,10 @@ jobs:
       - uses: taiki-e/install-action@v2.87.3
         with:
           tool: cargo-nextest
-      - run: cargo nextest run --workspace --locked
+      - run: cargo nextest run ${{ matrix.scope }} --locked
       # nextest runs one test per process and so cannot run doctests at all.
       # They are most of what documents the map's memory accounting, so they get their own step rather than being quietly dropped.
-      - run: cargo test --workspace --locked --doc
+      - run: cargo test ${{ matrix.scope }} --locked --doc
 
   # Half the goal of this project, asserted rather than described.
   #

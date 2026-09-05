@@ -12,7 +12,7 @@
 //!
 //! # The loop
 //!
-//! Level-triggered, one read a readiness event, no timers except a poll timeout that gives the clock a tick and the map a sweep. Everything a connection does is in [`conn`], and everything a command does is in [`dispatch`].
+//! Level-triggered, one read a readiness event, no timers except a poll timeout that gives the clock a tick and the map a sweep. Everything a connection does is in `conn`, and everything a command does is in `dispatch`.
 
 pub mod config;
 mod conn;

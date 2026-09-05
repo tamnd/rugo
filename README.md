@@ -18,6 +18,8 @@ The memory half needs two numbers and they are different claims. Total bytes per
 
 ## Running it
 
+Linux and macOS. The poller is epoll and kqueue and the listener is a unix socket, and the Windows equivalent is IOCP, which would be a second server rather than a build of this one. The crates below the server — the hash, the arena, the map and the parser — are portable and are built and tested on Windows too, so a change that only compiles on one target is caught, but there is no Windows binary and no `rugo.exe`.
+
 ```
 cargo build --release
 ./target/release/rugo --maxmemory 4gb

@@ -441,7 +441,7 @@ impl Table {
 
     /// Give back index slots the table has stopped needing, reporting whether it did.
     ///
-    /// Not done from inside [`Table::erase`], which is where it would be tidiest, because rehashing moves every entry and [`Table::sweep`] walks slot numbers across successive erases. A shrink under that walk would leave it reading positions that no longer mean what it thought. So the caller asks for this once, after it has finished erasing.
+    /// Not done from inside `erase`, which is where it would be tidiest, because rehashing moves every entry and `sweep` walks slot numbers across successive erases. A shrink under that walk would leave it reading positions that no longer mean what it thought. So the caller asks for this once, after it has finished erasing.
     ///
     /// The target leaves the table at half full rather than at its load factor, so that the next few inserts do not immediately rebuild what this just tore down.
     pub fn shrink(&mut self) -> bool {

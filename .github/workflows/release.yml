@@ -74,12 +74,20 @@ jobs:
       - run: cargo xtask check
 
   # The same gates the branch runs, against the tag rather than against a branch tip that has since moved.
+  # Windows takes the same reduced scope ci.yml gives it, for the same reason: the server is Unix and the portable crates are the ones a third target has an opinion about.
   verify:
     needs: check
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
+        include:
+          - os: ubuntu-latest
+            scope: --workspace
+          - os: macos-latest
+            scope: --workspace
+          - os: windows-latest
+            scope: --workspace --exclude rugo --exclude rugo-net --exclude rugo-server
     runs-on: ${{ matrix.os }}
     timeout-minutes: 25
     steps:
@@ -93,12 +101,13 @@ jobs:
         with:
           save-if: false
       - run: cargo fmt --all --check
-      - run: cargo clippy --workspace --all-targets --all-features
-      - run: cargo test --workspace --locked
-      - run: cargo test --workspace --locked --release
+      - run: cargo clippy ${{ matrix.scope }} --all-targets --all-features
+      - run: cargo test ${{ matrix.scope }} --locked
+      - run: cargo test ${{ matrix.scope }} --locked --release
 
-  # One binary per platform anyone actually runs a cache server on, plus the two anyone develops on.
+  # One binary per platform anyone actually runs a cache server on, plus the one anyone develops on.
   # The linux-arm64 entry is a native runner rather than a cross build: this server has a NEON probe path that no other target compiles, and a cross built binary from an x86 host is a binary whose hot loop nobody has run.
+  # There is no Windows binary. The poller is epoll and kqueue and the listener is a unix socket, and the Windows equivalent is IOCP, which would be a second server rather than a build of this one. Shipping an archive that does not exist is better than shipping one that would not start.
   build:
     needs: [check, verify]
     strategy:
@@ -111,8 +120,6 @@ jobs:
             target: aarch64-unknown-linux-gnu
           - os: macos-latest
             target: aarch64-apple-darwin
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     steps:
@@ -132,16 +139,12 @@ jobs:
           v="${{ needs.check.outputs.version }}"
           name="rugo-$v-${{ matrix.target }}"
           mkdir -p "dist/$name"
-          if [ -f "target/${{ matrix.target }}/release/rugo.exe" ]; then
-            cp "target/${{ matrix.target }}/release/rugo.exe" "dist/$name/"
-          else
-            cp "target/${{ matrix.target }}/release/rugo" "dist/$name/"
-          fi
+          cp "target/${{ matrix.target }}/release/rugo" "dist/$name/"
           # SCOREBOARD.md travels with the binary, because the claim and the thing the claim is about should not be one click apart.
           cp README.md LICENSE-APACHE SCOREBOARD.md "dist/$name/"
           tar -C dist -czf "dist/$name.tar.gz" "$name"
           # Written next to the archive rather than only in the release notes, so a copy that was fetched once and passed around can still be checked.
-          # The three runners do not agree on which tool exists. Linux and the Git Bash that Windows runs this step under have sha256sum, macOS has shasum and not sha256sum.
+          # The runners do not agree on which tool exists. Linux has sha256sum, macOS has shasum and not sha256sum.
           cd dist
           if command -v sha256sum >/dev/null 2>&1; then
             sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"

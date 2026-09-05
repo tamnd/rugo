@@ -16,7 +16,7 @@
 //!
 //! # Why segments grow
 //!
-//! Splitting the reference into a segment number and an offset, rather than treating it as one flat unit index, is what lets segments differ in size, and that is what keeps a shard that holds three keys from costing what a shard that holds three million does. The first segment is [`MIN_SEGMENT`] and each one after it is a sixteenth of what the arena already holds, up to [`MAX_SEGMENT`]. See [`next_segment_size`] for why a sixteenth and not a doubling.
+//! Splitting the reference into a segment number and an offset, rather than treating it as one flat unit index, is what lets segments differ in size, and that is what keeps a shard that holds three keys from costing what a shard that holds three million does. The first segment is [`MIN_SEGMENT`] and each one after it is a sixteenth of what the arena already holds, up to [`MAX_SEGMENT`]. See `next_segment_size` for why a sixteenth and not a doubling.
 //!
 //! One fixed segment size has to choose between a floor and a tail. Large segments mean a cache with four thousand shards pays that size four thousand times over before it is useful; small segments mean a segment ends every time its tail is too short for the next entry. Growing segments have the small floor, and the tail is not lost either: it goes on the free list of whatever class it happens to be, which is what makes the small floor affordable.
 //!
@@ -64,7 +64,7 @@ const CLASSES: usize = SMALL_MAX / GRAIN;
 
 /// The reciprocal of how much a new segment adds to what the arena already holds.
 ///
-/// Sixteen, so a segment is a sixteenth. See [`next_segment_size`].
+/// Sixteen, so a segment is a sixteenth. See `next_segment_size`.
 const GROWTH: usize = 16;
 
 /// A reference to bytes in an [`Arena`], four bytes wide.

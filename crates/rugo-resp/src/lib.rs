@@ -256,7 +256,7 @@ fn newline(from: &[u8]) -> Option<usize> {
 
 /// Where the first newline in `from` is, read a machine word at a time.
 ///
-/// Kept beside [`newline`] and used by nothing yet on purpose: the point of a wide scan is a long buffer, and every line this parser reads is a short one. It is here because the batch parser in M5 wants it and because a scan with no test beside it is a scan that is wrong.
+/// Kept beside `newline` and used by nothing yet on purpose: the point of a wide scan is a long buffer, and every line this parser reads is a short one. It is here because the batch parser in M5 wants it and because a scan with no test beside it is a scan that is wrong.
 #[must_use]
 pub fn scan(from: &[u8]) -> Option<usize> {
     /// One in every byte of a word.
@@ -311,7 +311,7 @@ fn number(text: &[u8]) -> Result<i64, Bad> {
 
 /// Read a signed decimal out of a client's argument.
 ///
-/// Separate from the internal [`number`] so that a bad `INCR` argument is a command error the connection survives, rather than a framing error that closes it.
+/// Separate from the internal `number` so that a bad `INCR` argument is a command error the connection survives, rather than a framing error that closes it.
 ///
 /// # Errors
 ///

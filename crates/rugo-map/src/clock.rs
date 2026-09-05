@@ -2,7 +2,7 @@
 //!
 //! Expiry is checked on every read, and reading a clock is a call into the kernel's shared page at best and a syscall at worst. A cache doing a million reads a second does not need a million distinct answers to a question whose resolution is one second, so the answer is taken once per event loop turn and read from a word after that.
 //!
-//! One second is the resolution because that is the resolution the protocols have: Redis's `EXPIRE` and memcache's `exptime` are both whole seconds, and `PEXPIRE`'s milliseconds are converted by the caller. Storing seconds is what lets an expiry fit in the four bytes [`crate::entry`] gives it.
+//! One second is the resolution because that is the resolution the protocols have: Redis's `EXPIRE` and memcache's `exptime` are both whole seconds, and `PEXPIRE`'s milliseconds are converted by the caller. Storing seconds is what lets an expiry fit in the four bytes the entry header gives it.
 
 use core::sync::atomic::{AtomicU32, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};

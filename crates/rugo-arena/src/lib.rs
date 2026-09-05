@@ -45,7 +45,7 @@ pub const MIN_SEGMENT: usize = if segment::LAZY { 1024 * 1024 } else { 4 * 1024 
 
 /// The largest a segment grows to.
 ///
-/// A cap rather than a target. Eight megabytes is what a twenty bit unit offset can address, so it is also the ceiling the reference width imposes, and at the two thousand and forty-eight segments a reference can name it puts sixteen gigabytes in reach of one shard of thousands.
+/// A cap rather than a target. Eight megabytes is what a twenty-one bit unit offset can address at a four byte grain, so it is also the ceiling the reference width imposes, and at the one thousand and twenty-four segments a reference can name it puts eight gigabytes in reach of one shard of thousands.
 pub const MAX_SEGMENT: usize = if segment::LAZY {
     8 * 1024 * 1024
 } else {
@@ -53,7 +53,9 @@ pub const MAX_SEGMENT: usize = if segment::LAZY {
 };
 
 /// The allocation grain, and the alignment every [`Ref`] therefore has.
-pub const GRAIN: usize = 8;
+///
+/// Four rather than eight. An entry is rounded up to a whole number of grains, so the grain is a tax on every entry of half itself on average, which at the benchmark's shape is two bytes an entry against a total overhead of twenty. Four is the floor: a free block has to hold the free list link, and that link is a [`Ref`], which is four bytes.
+pub const GRAIN: usize = 4;
 
 /// Whether the part of a segment nothing has been written into is free.
 ///
@@ -74,10 +76,12 @@ pub fn granule() -> usize {
 pub const SMALL_MAX: usize = 2048;
 
 /// Bits of a [`Ref`] naming a segment.
-const SEG_BITS: u32 = 11;
+///
+/// One fewer than the offset gained when the grain halved. A reference is thirty-one bits and a flag, so the two share a fixed budget: a finer grain needs another offset bit to address the same segment, and the segment count is where it comes from. A thousand segments of eight megabytes is eight gigabytes in one shard of thousands, which is far past anything this is asked to hold.
+const SEG_BITS: u32 = 10;
 
-/// Bits of a [`Ref`] naming an eight byte unit within a segment.
-const OFF_BITS: u32 = 20;
+/// Bits of a [`Ref`] naming a four byte unit within a segment.
+const OFF_BITS: u32 = 21;
 
 /// The mask that takes the unit offset out of a [`Ref`].
 const OFF_MASK: u32 = (1 << OFF_BITS) - 1;
@@ -179,7 +183,7 @@ const fn next_segment_size(held: usize) -> usize {
 
 /// Narrow a count the arena has already bounded.
 ///
-/// Three counts become `u32` here and every one of them is small: a unit count inside a segment is at most [`MAX_SEGMENT`] over [`GRAIN`], which is a hundred and thirty thousand, and a segment number is at most [`MAX_SEGMENTS`]. Writing the bound in one place rather than three is what makes it checkable.
+/// Three counts become `u32` here and every one of them is small: a unit count inside a segment is at most [`MAX_SEGMENT`] over [`GRAIN`], which is two million, and a segment number is at most [`MAX_SEGMENTS`]. Writing the bound in one place rather than three is what makes it checkable.
 #[inline]
 #[expect(
     clippy::cast_possible_truncation,
@@ -203,7 +207,7 @@ pub struct Arena {
     off: u32,
     /// Free list heads, one per size class in use, each holding [`Ref`] bits or `u32::MAX`.
     ///
-    /// Grown to reach the largest class the shard has actually allocated, never to [`CLASSES`]. A full table is a kilobyte, and a cache is normally holding entries of a few sizes near each other, so a shard that stores hundred byte values keeps sixteen heads rather than two hundred and fifty-six. Across four thousand shards that is the difference between four megabytes of free list heads and sixty kilobytes, and the four megabytes would be there whether or not anything was stored.
+    /// Grown to reach the largest class the shard has actually allocated, never to [`CLASSES`]. A full table is two kilobytes, and a cache is normally holding entries of a few sizes near each other, so a shard that stores hundred byte values keeps twenty-six heads rather than five hundred and twelve. Across four thousand shards that is the difference between eight megabytes of free list heads and four hundred kilobytes, and the eight megabytes would be there whether or not anything was stored.
     free: Vec<u32>,
     /// Individually allocated oversized entries. A hole is an empty slice.
     large: Vec<Box<[u8]>>,
@@ -807,9 +811,10 @@ mod tests {
     fn a_peek_never_runs_off_the_end() {
         // The map reads an eleven byte header prefix off entries that may be four bytes long, and the last one in a segment has nothing after it. Asking `get` for eleven there would panic.
         let mut arena = Arena::new();
-        let units = MIN_SEGMENT / GRAIN;
+        // Eight byte blocks, counted so that they fill exactly one segment. Counting them in grains was the same number until the grain halved, and then it was two segments and the last unit of the first one was never the one being peeked at.
+        let blocks = MIN_SEGMENT / 8;
         let mut last = Ref::NONE;
-        for _ in 0..units {
+        for _ in 0..blocks {
             last = arena.alloc(8).unwrap();
             arena.get_mut(last, 8).fill(0xcd);
         }
@@ -839,10 +844,17 @@ mod tests {
 
     #[test]
     fn the_grain_is_the_whole_overhead() {
-        // The claim the crate exists to make. A hundred byte entry costs a hundred and four bytes, not a hundred and twenty-odd, because there is no header.
+        // The claim the crate exists to make. There is no header, so an entry costs its own length rounded up to the grain and nothing else, and at a four byte grain a hundred byte entry costs a hundred rather than the hundred and twenty-odd a malloc would charge.
         let mut arena = Arena::new();
         for _ in 0..1000 {
             let _ = arena.alloc(100);
+        }
+        assert_eq!(arena.live_bytes(), 100 * 1000);
+
+        // And where there is rounding it is at most three bytes rather than the seven an eight byte grain could cost.
+        let mut arena = Arena::new();
+        for _ in 0..1000 {
+            let _ = arena.alloc(101);
         }
         assert_eq!(arena.live_bytes(), 104 * 1000);
     }

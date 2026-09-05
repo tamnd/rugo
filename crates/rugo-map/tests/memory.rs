@@ -55,6 +55,40 @@ impl Cost {
     }
 }
 
+/// The value length entry `n` gets under the spread the harness uses.
+///
+/// `memtier_benchmark` is run with `--data-size-range 1-1024`, so every length in that range occurs and the rounding up to the grain is paid at every offset within it. A fixed length either rounds or does not, which is why the shapes above can miss a change to the grain entirely and this one cannot.
+fn spread_len(n: u32) -> usize {
+    1 + (n as usize).wrapping_mul(2_654_435_761) % 1024
+}
+
+/// Fill a map with the harness's spread of value lengths and measure it.
+fn fill_spread(count: u32, shards: usize) -> Cost {
+    let map = Map::new(shards, 0);
+    let mut payload = 0usize;
+    for n in 0..count {
+        let key = key_of(n);
+        let value = vec![0xa5u8; spread_len(n)];
+        payload += key.len() + value.len();
+        assert!(
+            map.set(&key, &value, None, None).is_ok(),
+            "the map refused a write with no ceiling set"
+        );
+    }
+    assert_eq!(
+        map.len(),
+        count as usize,
+        "the map lost entries while filling"
+    );
+    Cost {
+        payload,
+        index: map.index_bytes(),
+        live: map.live_bytes(),
+        resident: map.resident_bytes(),
+        entries: map.len(),
+    }
+}
+
 /// Fill a map and measure it.
 fn fill(count: u32, value_len: usize, shards: usize) -> Cost {
     let map = Map::new(shards, 0);
@@ -123,9 +157,12 @@ fn varint_len(mut value: usize) -> usize {
 
 #[test]
 fn an_entry_costs_its_header_and_nothing_but_the_grain() {
-    // The entry encoding and the allocation grain, and no allowance for anything else. The header is one flags byte and a varint for each of the two lengths, which is exactly predictable, so it is predicted here and subtracted. What is left can only be the rounding up to the eight byte grain, and rounding to a grain cannot cost a whole grain.
+    // The entry encoding and the allocation grain, and no allowance for anything else. The header is one flags byte and a varint for each of the two lengths, which is exactly predictable, so it is predicted here and subtracted. What is left can only be the rounding up to the grain, and rounding to a grain cannot cost a whole grain.
+    //
+    // The bound is the crate's own constant rather than the number it currently holds, because a gate written against a literal eight goes on passing after the grain halves and stops being a gate at all.
     //
     // There is no allocator header in this number, because there is no allocator header. That is the eight to sixteen bytes a cache calling `malloc` once per entry pays and this one does not.
+    let limit = rugo_arena::GRAIN as f64;
     for &(count, value_len, shards) in SHAPES {
         let cost = fill(count, value_len, shards);
         let key_len = key_of(0).len();
@@ -136,10 +173,34 @@ fn an_entry_costs_its_header_and_nothing_but_the_grain() {
             "{count}x{value_len} over {shards} shards: {header} bytes of header, {grain:.2} of grain"
         );
         assert!(
-            (0.0..8.0).contains(&grain),
-            "{beyond:.2} bytes an entry beyond key and value, against a {header} byte header, leaves {grain:.2} for a grain of 8"
+            (0.0..limit).contains(&grain),
+            "{beyond:.2} bytes an entry beyond key and value, against a {header} byte header, leaves {grain:.2} for a grain of {}",
+            rugo_arena::GRAIN
         );
     }
+}
+
+#[test]
+fn the_grain_costs_half_itself_where_every_length_occurs() {
+    // The shapes above hold one value length each, so each of them either rounds or does not and the average is whichever it happened to be. The harness draws its lengths from the whole of one to a thousand and twenty-four, where every remainder occurs about equally often and the rounding costs half a grain an entry on average.
+    //
+    // That average is what the grain is actually worth on the published shape, so it is the thing worth bounding: below half a grain the arithmetic would have to be wrong, and above a whole grain something other than rounding is being counted.
+    let cost = fill_spread(1_000_000, 4096);
+    let mut headers = 0usize;
+    for n in 0..1_000_000u32 {
+        headers += 1 + varint_len(key_of(n).len()) + varint_len(spread_len(n));
+    }
+    let grain = (cost.live - cost.payload - headers) as f64 / cost.entries as f64;
+    let half = rugo_arena::GRAIN as f64 / 2.0;
+    println!(
+        "a million entries over the harness's spread: {grain:.2} bytes of grain an entry, against a grain of {}",
+        rugo_arena::GRAIN
+    );
+    assert!(
+        grain > half - 1.0 && grain < rugo_arena::GRAIN as f64,
+        "{grain:.2} bytes an entry of rounding, which is not the half of {} that a uniform spread of lengths should cost",
+        rugo_arena::GRAIN
+    );
 }
 
 #[test]
@@ -182,6 +243,16 @@ fn report_the_numbers_the_scoreboard_quotes() {
             cost.overhead()
         );
     }
+    // The published shape, and the only row here whose value lengths are the harness's rather than one repeated number. It is a tenth of the ten million the sweep fills, because a test that runs on every push cannot hold five gigabytes.
+    let cost = fill_spread(1_000_000, 4096);
+    println!(
+        "{:>7}  {:>5}  {:>6}  {:>13.2}  {:>16.2}",
+        1_000_000,
+        "1-1k",
+        4096,
+        cost.total(),
+        cost.overhead()
+    );
 }
 
 #[test]

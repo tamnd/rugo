@@ -15,6 +15,10 @@
 //! An overhead ceiling of, say, twenty bytes is a number with no argument behind it, and the temptation when it fails by half a byte is to write twenty-one. The three assertions below each bound one mechanism, so a failure names its own cause and a threshold cannot be moved without admitting which part of the design got worse.
 //!
 //! Their sum is the overhead, and the report at the end prints it.
+//!
+//! # Why every test here is skipped under Miri
+//!
+//! This file measures rather than checks. Every assertion in it is a ratio of byte counts over two and a half million entries, and a ratio like that needs its scale: divide the counts and what the assertion reads is the fixed cost of sixty-four or four thousand shards rather than anything the design did. Miri would need days for one shape of one of them besides. The segments are the boxed slice path under an interpreter as well, which holds a reserve the mapping path does not, so the figures it printed would not be the figures this file is about. The gate runs in release on every push, which is where a measurement belongs, and the unsafe that Miri is there for is exercised by the unit tests in `rugo-map` and `rugo-arena`, which it does interpret.
 
 // Every number here is a ratio of byte counts meant for a human to read to two decimal places, and a byte count large enough to lose a mantissa bit is a byte count no test in this file allocates.
 #![expect(
@@ -137,6 +141,7 @@ const SHAPES: &[(u32, usize, usize)] = &[
 ];
 
 #[test]
+#[cfg_attr(miri, ignore = "a measurement rather than a soundness check")]
 fn the_index_costs_under_eleven_bytes_an_entry() {
     // Five bytes a slot is the structural claim and `table.rs` checks it exactly. This checks what it comes to per entry, which is five divided by the load factor, and the load factor is what a growth rule controls.
     //
@@ -177,6 +182,7 @@ fn header_len(key_len: usize, value_len: usize) -> usize {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "a measurement rather than a soundness check")]
 fn an_entry_costs_its_header_and_nothing_but_the_grain() {
     // The entry encoding and the allocation grain, and no allowance for anything else. The header is one flags byte carrying the key length, and a varint for the value, which is exactly predictable, so it is predicted here and subtracted. What is left can only be the rounding up to the grain, and rounding to a grain cannot cost a whole grain.
     //
@@ -201,6 +207,7 @@ fn an_entry_costs_its_header_and_nothing_but_the_grain() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "a measurement rather than a soundness check")]
 fn the_grain_costs_half_itself_where_every_length_occurs() {
     // The shapes above hold one value length each, so each of them either rounds or does not and the average is whichever it happened to be. The harness draws its lengths from the whole of one to a thousand and twenty-four, where every remainder occurs about equally often and the rounding costs half a grain an entry on average.
     //
@@ -224,6 +231,7 @@ fn the_grain_costs_half_itself_where_every_length_occurs() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "a measurement rather than a soundness check")]
 fn the_arena_holds_little_beyond_what_it_handed_out() {
     // Everything the arena is charged for that is neither the index nor an entry: the part of the newest segment nothing has been written into, and the tails abandoned where a segment ended too short for the next entry.
     //
@@ -254,6 +262,7 @@ fn the_arena_holds_little_beyond_what_it_handed_out() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "a measurement rather than a soundness check")]
 fn report_the_numbers_the_scoreboard_quotes() {
     // Not a gate. The three above bound the mechanisms; this prints what they add up to, in the form the scoreboard carries, so that the published number and the tested one are the same number.
     println!("entries  value  shards  total B/entry  overhead B/entry");
@@ -281,6 +290,7 @@ fn report_the_numbers_the_scoreboard_quotes() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "a measurement rather than a soundness check")]
 fn four_thousand_empty_shards_are_nearly_free() {
     // The design cost of sharding this finely. An arena that allocated eagerly would charge sixty-four kilobytes a shard here, which is a quarter of a gigabyte before a single key exists, and would make the fine sharding the throughput target depends on unaffordable.
     let map = Map::with_seed(4096, 0, SEED);
@@ -291,6 +301,7 @@ fn four_thousand_empty_shards_are_nearly_free() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "a measurement rather than a soundness check")]
 fn one_key_does_not_wake_four_thousand_shards() {
     // A shard allocates on its first write and only then, so a map holding one key should be holding one index and one segment, not four thousand of each.
     let map = Map::with_seed(4096, 0, SEED);
@@ -305,6 +316,7 @@ fn one_key_does_not_wake_four_thousand_shards() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "a measurement rather than a soundness check")]
 fn sharding_does_not_cost_much_at_scale() {
     // Sixty-four shards against four thousand over the same working set. Every shard carries its own index and its own part-used last page, so more shards is strictly more slack; the claim is that at a million entries the slack is small enough that the concurrency is worth having.
     //

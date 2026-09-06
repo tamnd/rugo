@@ -149,7 +149,8 @@ jobs:
     if: needs.wanted.outputs.run == 'true'
     name: miri (${{ matrix.borrows }}, ${{ matrix.crate }})
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # Forty-five rather than thirty. The slowest shard is `rugo-map` under tree borrows, which takes just under ten minutes on an M4 Mac against two under stacked, and a hosted runner is slower than that by an amount nobody has measured. Thirty was a guess made before the job had ever finished, and it was the reason three shards were killed rather than answered.
+    timeout-minutes: 45
     strategy:
       # One shard failing is a real finding and every other shard's result is still worth having, so a failure does not cancel its siblings.
       fail-fast: false
@@ -175,8 +176,11 @@ jobs:
       # Pinned to four rather than left to follow the core count, so that a bigger runner cannot quietly turn this into sixteen interpreters and an out of memory kill that reads like a hang.
       #
       # Isolation is disabled because the map reads the clock for every TTL and Miri's isolated clock does not move.
-      # `rugo-server` and `rugo-net` open sockets, which Miri has no shim for, so their tests are the ones that will report unsupported operations rather than findings; that is worth knowing per crate rather than hidden behind a workspace run.
-      - run: cargo miri nextest run --locked -p ${{ matrix.crate }} --test-threads 4
+      #
+      # Some tests are skipped under Miri: the ones in `rugo-server` and `rugo-net` that open a socket, which Miri has no shim for, and a handful whose assertion is a ratio that a divided count would not support. Every one of them carries a `cfg_attr(miri, ignore)` naming its reason at the test rather than here, so the skip is visible to whoever runs Miri by hand as well as to this workflow.
+      # `--no-tests=pass` is for `rugo`, which is a binary with no tests of its own and would otherwise fail this job for having nothing to interpret.
+      # `--no-fail-fast` because the first unsound thing Miri finds is not the only one worth knowing about, and stopping at it means a second run to see the rest.
+      - run: cargo miri nextest run --locked --no-fail-fast --no-tests=pass -p ${{ matrix.crate }} --test-threads 4
         env:
           MIRIFLAGS: >-
             ${{ matrix.borrows == 'tree'

@@ -605,6 +605,22 @@ fn evict_to_fit(table: &mut Table, budget: usize, key: &[u8], hash: u64) {
     }
 }
 
+/// A count in a test, divided down to what Miri can finish.
+///
+/// Miri interprets every instruction and this crate's tests are the ones worth interpreting, so the two pull against each other: a table filled with twenty thousand keys and emptied again takes a few milliseconds natively and eleven minutes under Miri, and `deep.yml` gives the whole crate thirty. Left alone, the interpreter spends its half hour inside three tests and is killed before it reaches the rest, which is how a job that was meant to decide whether the unsafe code is sound ends up deciding nothing.
+///
+/// Dividing is sound because none of these counts is the claim. What a large count buys is the certainty that the table grew several times, that probe sequences wrapped around it, that a removal left a tombstone a later probe had to walk past, and that eight threads had room to interleave badly. A table a hundredth of the size reaches every one of those, because they are properties of the load factor and the probe rule rather than of the number of keys. The full count still runs on every push, natively, in `ci.yml`.
+///
+/// Four is the floor, because a count divided to one or nought is a test that stopped testing rather than a test that got smaller.
+#[cfg(test)]
+pub(crate) const fn fewer(count: u32) -> u32 {
+    if cfg!(miri) {
+        if count / 100 < 4 { 4 } else { count / 100 }
+    } else {
+        count
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -625,7 +641,7 @@ mod tests {
     fn asking_early_does_not_change_any_answer() {
         // The whole safety claim of the two hints is that they are hints: they read nothing, they take nothing, and a map that has been warmed answers exactly as one that has not. So this warms every key, including a table that has been rebuilt underneath the hint since it was published, and then asks for all of them.
         let map = map();
-        for i in 0..20_000u32 {
+        for i in 0..fewer(20_000) {
             map.set(
                 format!("k{i}").as_bytes(),
                 format!("v{i}").as_bytes(),
@@ -634,7 +650,7 @@ mod tests {
             )
             .unwrap();
         }
-        for i in 0..20_000u32 {
+        for i in 0..fewer(20_000) {
             let key = format!("k{i}");
             map.warm(key.as_bytes());
             map.warm_entry(key.as_bytes());
@@ -665,7 +681,7 @@ mod tests {
     #[test]
     fn what_goes_in_comes_out() {
         let map = map();
-        for i in 0..50_000u32 {
+        for i in 0..fewer(50_000) {
             map.set(
                 format!("k{i}").as_bytes(),
                 format!("v{i}").as_bytes(),
@@ -674,8 +690,8 @@ mod tests {
             )
             .unwrap();
         }
-        assert_eq!(map.len(), 50_000);
-        for i in 0..50_000u32 {
+        assert_eq!(map.len(), fewer(50_000) as usize);
+        for i in 0..fewer(50_000) {
             assert_eq!(
                 get(&map, format!("k{i}").as_bytes()).as_deref(),
                 Some(format!("v{i}").as_bytes())
@@ -684,8 +700,11 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "a spread claim that a divided count would not support")]
     fn the_shards_get_roughly_equal_shares() {
         // A shard index drawn from bits that the tag or the group index also uses would pile keys into a few shards, and the lock nobody waits on would become the lock everybody waits on.
+        //
+        // Skipped under Miri rather than divided the way the counts around it are. What this asserts is that the fullest shard is within a factor of the mean, and a mean of six keys a shard says nothing about a hash either way. It is also the one test here with no unsafe code under it, so it is the one there is least reason to interpret.
         let map = map();
         for i in 0..64_000u32 {
             map.set(format!("memtier-{i}").as_bytes(), b"v", None, None)
@@ -714,11 +733,11 @@ mod tests {
         // The shift would be sixty-four, which is not a shift, so this is the case that would panic rather than merely misbehave.
         let map = Map::with_seed(1, 0, SEED);
         assert_eq!(map.shards(), 1);
-        for i in 0..1000u32 {
+        for i in 0..fewer(1000) {
             map.set(format!("k{i}").as_bytes(), b"v", None, None)
                 .unwrap();
         }
-        assert_eq!(map.len(), 1000);
+        assert_eq!(map.len(), fewer(1000) as usize);
         assert_eq!(get(&map, b"k7").as_deref(), Some(&b"v"[..]));
     }
 
@@ -747,27 +766,34 @@ mod tests {
     fn a_sweep_reclaims_what_nobody_reads() {
         let map = Map::with_seed(8, 0, SEED);
         let now = map.clock().now();
-        for i in 0..4000u32 {
+        for i in 0..fewer(4000) {
             map.set(format!("k{i}").as_bytes(), b"v", Some(now + 1), None)
                 .unwrap();
         }
         map.clock().advance(2);
-        assert_eq!(map.len(), 4000, "expiry alone should not reclaim anything");
+        assert_eq!(
+            map.len(),
+            fewer(4000) as usize,
+            "expiry alone should not reclaim anything"
+        );
 
         let mut removed = 0;
-        for _ in 0..4000 {
+        for _ in 0..fewer(4000) {
             removed += map.sweep(64);
             if map.is_empty() {
                 break;
             }
         }
-        assert_eq!(removed, 4000);
+        assert_eq!(removed, fewer(4000) as usize);
         assert_eq!(map.len(), 0);
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "a ceiling claim that needs both of its numbers")]
     fn a_ceiling_is_defended() {
         // Half a megabyte of ceiling against several megabytes of writes. The exact resting point is not the claim; not growing without bound is.
+        //
+        // Skipped under Miri rather than divided the way the counts around it are, because this one has two numbers and they have to move together. Dividing the writes alone puts everything under the ceiling and the test stops testing, and dividing the ceiling with them takes it below what sixteen shards cost before a single key is written, so what the assertion reads is the map's fixed cost rather than anything eviction did.
         let ceiling = 512 * 1024;
         let map = Map::with_seed(16, ceiling, SEED);
         for i in 0..100_000u32 {
@@ -816,13 +842,13 @@ mod tests {
     #[test]
     fn no_ceiling_means_no_eviction() {
         let map = map();
-        for i in 0..20_000u32 {
+        for i in 0..fewer(20_000) {
             map.set(format!("k{i}").as_bytes(), &[0u8; 256], None, None)
                 .unwrap();
         }
         assert_eq!(
             map.len(),
-            20_000,
+            fewer(20_000) as usize,
             "something was evicted from an unlimited map"
         );
     }
@@ -830,7 +856,7 @@ mod tests {
     #[test]
     fn clearing_empties_every_shard() {
         let map = map();
-        for i in 0..10_000u32 {
+        for i in 0..fewer(10_000) {
             map.set(format!("k{i}").as_bytes(), b"v", None, None)
                 .unwrap();
         }
@@ -843,16 +869,18 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "a slack ratio that needs both of its numbers")]
     fn the_accounting_adds_up() {
+        // Skipped under Miri rather than divided the way the counts around it are. The last assertion is a slack ratio, and a slack ratio needs enough entries for the fixed cost of sixty-four shards to be amortised over them. A divided count leaves sixty-four segments holding two hundred entries between them, so what the ratio reads is a segment size and not anything the accounting did.
         let map = map();
-        for i in 0..20_000u32 {
+        for i in 0..fewer(20_000) {
             map.set(format!("k{i}").as_bytes(), &[0u8; 100], None, None)
                 .unwrap();
         }
         let resident = map.resident_bytes();
         let live = map.live_bytes();
         assert!(
-            live > 20_000 * 100,
+            live > fewer(20_000) as usize * 100,
             "the live bytes do not cover the values"
         );
         assert!(resident > live, "resident memory should include the index");
@@ -870,7 +898,7 @@ mod tests {
             .map(|t| {
                 let map = Arc::clone(&map);
                 thread::spawn(move || {
-                    for i in 0..20_000u32 {
+                    for i in 0..fewer(20_000) {
                         let key = format!("t{t}:k{i}");
                         map.set(key.as_bytes(), key.as_bytes(), None, None).unwrap();
                     }
@@ -881,9 +909,9 @@ mod tests {
             thread.join().unwrap();
         }
 
-        assert_eq!(map.len(), 8 * 20_000);
+        assert_eq!(map.len(), 8 * fewer(20_000) as usize);
         for t in 0..8u32 {
-            for i in (0..20_000u32).step_by(97) {
+            for i in (0..fewer(20_000)).step_by(97) {
                 let key = format!("t{t}:k{i}");
                 assert_eq!(
                     get(&map, key.as_bytes()).as_deref(),
@@ -898,7 +926,7 @@ mod tests {
     fn readers_and_writers_together_see_whole_values() {
         // A reader that saw a half-written entry would see a value whose bytes do not match its key. Nothing here checks timing; it checks that no torn value is ever observed.
         let map = Arc::new(map());
-        for i in 0..2000u32 {
+        for i in 0..fewer(2000) {
             let key = format!("k{i}");
             map.set(key.as_bytes(), key.as_bytes(), None, None).unwrap();
         }
@@ -907,8 +935,8 @@ mod tests {
             .map(|t| {
                 let map = Arc::clone(&map);
                 thread::spawn(move || {
-                    for round in 0..5000u32 {
-                        let i = (round * 7 + t) % 2000;
+                    for round in 0..fewer(5000) {
+                        let i = (round * 7 + t) % fewer(2000);
                         let key = format!("k{i}");
                         if t % 2 == 0 {
                             map.set(key.as_bytes(), key.as_bytes(), None, None).unwrap();

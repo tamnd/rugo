@@ -415,6 +415,7 @@ impl Worker<'_> {
     }
 }
 
+/// Every test here is skipped under Miri, for the reason given over the tests in [`conn`]: they start a server on a real socket, and Miri has no kernel to give them one.
 #[cfg(test)]
 mod tests {
     use std::io::{BufRead, BufReader, Write};
@@ -482,6 +483,7 @@ mod tests {
     //
     // A connection lives on the thread that accepted it, so how a burst of them is divided up is how the load is divided up for as long as they last. Accepting until the listener blocked gave the whole burst to whichever thread woke first, and measured on `gpc` at sixteen threads that left four threads carrying the work, five of them at three per cent of a core, and the process using four and a half of its sixteen. The contract that prevents it is this one, and it is worth stating where it cannot drift: one call, one connection.
     #[test]
+    #[cfg_attr(miri, ignore = "Miri has no kernel to open a socket against")]
     fn a_turn_at_the_listener_takes_one_connection_and_leaves_the_rest() {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bound");
         listener.set_nonblocking(true).expect("non-blocking");
@@ -536,6 +538,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri has no kernel to open a socket against")]
     fn a_client_can_set_and_get_over_tcp() {
         let port = serving(1);
         let back = talk(
@@ -551,6 +554,7 @@ mod tests {
     // It skips rather than fails where there is no ring, because a container's seccomp profile has the last word on whether the syscall is allowed and a test that fails in one is a test somebody deletes.
     #[cfg(target_os = "linux")]
     #[test]
+    #[cfg_attr(miri, ignore = "Miri has no kernel to open a socket against")]
     fn a_ring_serves_what_a_poller_serves() {
         if !rugo_net::uring::Ring::available() {
             return;
@@ -581,6 +585,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri has no kernel to open a socket against")]
     fn several_threads_share_one_map() {
         // The claim that makes the whole shape worth having: a key written on whichever thread took one connection is readable on whichever took another.
         let port = serving(4);
@@ -599,6 +604,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri has no kernel to open a socket against")]
     fn a_unix_socket_serves_the_same_thing() {
         let path = std::env::temp_dir().join(format!("rugo-test-{}.sock", std::process::id()));
         let config = Config {
@@ -630,6 +636,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri has no kernel to open a socket against")]
     fn a_port_already_taken_is_an_error_rather_than_a_panic() {
         let port = serving(1);
         let config = Config {

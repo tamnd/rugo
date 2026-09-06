@@ -705,6 +705,7 @@ const fn group_of(hash: u64, mask: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fewer;
 
     const SEED: u64 = 0x5eed;
 
@@ -842,15 +843,15 @@ mod tests {
     #[test]
     fn what_goes_in_comes_out() {
         let mut table = Table::new(SEED);
-        for i in 0..10_000u32 {
+        for i in 0..fewer(10_000) {
             set(
                 &mut table,
                 format!("key:{i}").as_bytes(),
                 format!("value:{i}").as_bytes(),
             );
         }
-        assert_eq!(table.len(), 10_000);
-        for i in 0..10_000u32 {
+        assert_eq!(table.len(), fewer(10_000) as usize);
+        for i in 0..fewer(10_000) {
             let key = format!("key:{i}");
             assert_eq!(
                 get(&mut table, key.as_bytes()).as_deref(),
@@ -863,10 +864,10 @@ mod tests {
     #[test]
     fn a_missing_key_is_missing() {
         let mut table = Table::new(SEED);
-        for i in 0..1000u32 {
+        for i in 0..fewer(1000) {
             set(&mut table, format!("key:{i}").as_bytes(), b"v");
         }
-        for i in 1000..2000u32 {
+        for i in fewer(1000)..fewer(1000) * 2 {
             assert_eq!(get(&mut table, format!("key:{i}").as_bytes()), None);
         }
     }
@@ -922,7 +923,7 @@ mod tests {
     fn a_tombstone_does_not_hide_a_later_key() {
         // The bug this catches is marking a slot empty on removal when a probe sequence ran past it, which does not crash: it makes an unrelated key silently unreachable. It needs enough keys that collisions are certain.
         let mut table = Table::new(SEED);
-        let n = 20_000u32;
+        let n = fewer(20_000);
         for i in 0..n {
             set(&mut table, format!("k{i}").as_bytes(), b"v");
         }
@@ -949,7 +950,7 @@ mod tests {
             set(&mut table, format!("k{i}").as_bytes(), b"v");
         }
         let settled = table.capacity();
-        for round in 1..200u32 {
+        for round in 1..fewer(200) {
             for i in 0..200u32 {
                 let old = format!("k{}", i + (round - 1) * 200);
                 table.remove(old.as_bytes(), h(old.as_bytes()));
@@ -1114,17 +1115,19 @@ mod tests {
     #[test]
     fn a_shrunken_table_gives_its_index_back() {
         let mut table = Table::new(SEED);
-        for i in 0..100_000u32 {
+        let all = fewer(100_000);
+        let most = all - all / 100;
+        for i in 0..all {
             set(&mut table, format!("k{i}").as_bytes(), b"v");
         }
         let grown = table.index_bytes();
-        for i in 0..99_000u32 {
+        for i in 0..most {
             let key = format!("k{i}");
             table.remove(key.as_bytes(), h(key.as_bytes()));
         }
         assert!(!table.shrink() || table.index_bytes() < grown / 8);
-        assert_eq!(table.len(), 1000);
-        for i in 99_000..100_000u32 {
+        assert_eq!(table.len(), (all - most) as usize);
+        for i in most..all {
             assert_eq!(
                 get(&mut table, format!("k{i}").as_bytes()).as_deref(),
                 Some(&b"v"[..]),
@@ -1138,12 +1141,14 @@ mod tests {
     fn charged_bytes_fall_when_entries_go() {
         // The property eviction depends on, and the reason the ceiling is measured against charged bytes rather than resident ones: the index comes back when the table shrinks, but the arena's segments never do.
         let mut table = Table::new(SEED);
-        for i in 0..20_000u32 {
+        let all = fewer(20_000);
+        let most = all - all / 20;
+        for i in 0..all {
             set(&mut table, format!("k{i}").as_bytes(), &[0u8; 64]);
         }
         let full = table.charged_bytes();
         let segments = table.resident_bytes() - table.index_bytes();
-        for i in 0..19_000u32 {
+        for i in 0..most {
             let key = format!("k{i}");
             table.remove(key.as_bytes(), h(key.as_bytes()));
         }
@@ -1170,7 +1175,7 @@ mod tests {
     fn the_index_costs_five_bytes_a_slot() {
         // The claim the crate exists to make, checked rather than asserted in prose. Pogocache's bucket entry is ten bytes for the same job.
         let mut table = Table::new(SEED);
-        for i in 0..100_000u32 {
+        for i in 0..fewer(100_000) {
             set(&mut table, format!("k{i}").as_bytes(), b"v");
         }
         assert_eq!(table.index_bytes(), table.capacity() * 5);
@@ -1180,7 +1185,7 @@ mod tests {
     fn the_table_stays_under_its_load_factor() {
         // A load factor that slipped would show up here before it showed up in a memory sweep.
         let mut table = Table::new(SEED);
-        for i in 0..100_000u32 {
+        for i in 0..fewer(100_000) {
             set(&mut table, format!("k{i}").as_bytes(), b"v");
         }
         assert!(

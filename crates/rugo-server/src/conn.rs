@@ -480,6 +480,7 @@ impl Conn {
     }
 }
 
+/// Every test here is skipped under Miri, because every one of them puts a real socket pair in front of a connection and Miri has no kernel to make one with. The interpreter stops the program rather than failing an assertion, which says nothing about the code. The unsafe this workspace wants interpreted is in the map and the arena, and no test in this file reaches it.
 #[cfg(test)]
 mod tests {
     use rugo_map::Map;
@@ -531,24 +532,28 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri has no kernel to open a socket against")]
     fn an_inline_ping_is_answered() {
         // What every readiness probe in the harness sends, and the reason inline commands are supported at all.
         assert_eq!(exchange(b"PING\r\n"), b"+PONG\r\n");
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri has no kernel to open a socket against")]
     fn a_pipeline_is_answered_in_order() {
         let input = b"*3\r\n$3\r\nSET\r\n$1\r\na\r\n$1\r\n1\r\n*2\r\n$3\r\nGET\r\n$1\r\na\r\n*1\r\n$4\r\nPING\r\n";
         assert_eq!(exchange(input), b"+OK\r\n$1\r\n1\r\n+PONG\r\n");
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri has no kernel to open a socket against")]
     fn half_a_command_waits_for_the_rest() {
         // The client sends a command in two pieces and hangs up. The first turn sees half, the second sees the close, and nothing is answered, which is what a partial request deserves.
         assert_eq!(exchange(b"*2\r\n$3\r\nGET\r\n$1\r\n"), b"");
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri has no kernel to open a socket against")]
     fn a_framing_error_is_reported_and_the_connection_goes() {
         let back = exchange(b"*1\r\n+PING\r\n");
         assert!(
@@ -559,11 +564,13 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri has no kernel to open a socket against")]
     fn quit_is_answered_before_the_connection_closes() {
         assert_eq!(exchange(b"QUIT\r\n"), b"+OK\r\n");
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri has no kernel to open a socket against")]
     fn commands_after_quit_are_not_run() {
         // Everything already read is in the buffer, and a client that said goodbye does not get another answer out of it.
         assert_eq!(exchange(b"QUIT\r\nPING\r\n"), b"+OK\r\n");

@@ -628,6 +628,8 @@ mod tests {
     /// A ring, or a message saying why this machine cannot have one.
     ///
     /// Every test here skips rather than fails when the kernel has no `io_uring`, because these run in containers whose seccomp profile forbids the syscall and a test that fails there is a test that gets deleted.
+    ///
+    /// That is not enough for Miri, which is why every caller of this carries a `cfg_attr(miri, ignore)` as well. A kernel that refuses the syscall returns an error and this returns `None`; an interpreter that has never heard of the syscall stops the program instead, and a stopped program is not a skip. The test above this one, which only checks that the ABI structures are the sizes the kernel says they are, needs no ring and is interpreted.
     fn ring() -> Option<Ring> {
         Ring::new(64).ok()
     }
@@ -642,6 +644,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri has no kernel to set a ring up against")]
     fn a_ring_carries_bytes_from_one_socket_to_another() {
         let Some(mut ring) = ring() else {
             return;
@@ -672,6 +675,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri has no kernel to set a ring up against")]
     fn a_send_reaches_the_peer() {
         let Some(mut ring) = ring() else {
             return;
@@ -698,6 +702,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri has no kernel to set a ring up against")]
     fn one_multishot_accept_takes_more_than_one_connection() {
         let Some(mut ring) = ring() else {
             return;
@@ -740,6 +745,7 @@ mod tests {
 
     // What the server relies on to keep a burst of connections from landing on one thread. A single shot accept takes one and then stops, so a thread that wants a second connection asks for it and gives the other threads a turn in between.
     #[test]
+    #[cfg_attr(miri, ignore = "Miri has no kernel to set a ring up against")]
     fn one_ordinary_accept_takes_one_connection_and_stops() {
         let Some(mut ring) = ring() else {
             return;
@@ -777,6 +783,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri has no kernel to set a ring up against")]
     fn a_timeout_wakes_a_ring_that_has_nothing_else_to_do() {
         let Some(mut ring) = ring() else {
             return;
@@ -809,6 +816,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri has no kernel to set a ring up against")]
     fn a_ring_that_is_full_says_so_rather_than_overwriting_itself() {
         let Some(mut ring) = ring() else {
             return;

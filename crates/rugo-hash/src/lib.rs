@@ -184,6 +184,9 @@ impl Hasher for RugoHasher {
     }
 }
 
+/// Two tests here are skipped under Miri.
+///
+/// Both are statistical: one hashes a million keys and counts collisions, the other hashes four hundred thousand and looks at how they land across four thousand shards. Neither survives being made smaller, because the sample size is the claim rather than an implementation detail of it, and neither finishes at full size under an interpreter that runs every instruction. This crate is `forbid(unsafe_code)` besides, so there is nothing here for Miri to find that the ordinary test run does not already say.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -241,6 +244,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "a collision count that needs its million keys")]
     fn a_million_sequential_keys_do_not_collide() {
         // The shape memtier generates: one prefix and an ascending number. A hash that is weak on this pattern is a hash that is weak on the benchmark.
         let mut seen = HashSet::with_capacity(1 << 20);
@@ -290,6 +294,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "a spread claim that needs its four hundred thousand")]
     fn the_high_bits_that_pick_a_shard_spread() {
         // The map takes the top twelve bits as the shard for a default 4096 shard table. A hash whose high bits barely move would put every key in a handful of shards and every measurement that followed would be a measurement of one lock.
         let shards = 4096usize;

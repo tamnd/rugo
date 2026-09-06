@@ -106,11 +106,11 @@ pub(crate) fn run(args: &[String]) -> Result<(), String> {
         return Ok(());
     }
     let load = parse(args)?;
-    let before = cpu_of(load.pid);
-    let client_before = cpu_of(Some(std::process::id()));
-
     fill(&load)?;
 
+    // After the fill rather than before it, so that what the fill spent is not charged to the operations that were timed.
+    let before = cpu_of(load.pid);
+    let client_before = cpu_of(Some(std::process::id()));
     let clock = Instant::now();
     let did = drive(&load)?;
     let elapsed = clock.elapsed().as_secs_f64();

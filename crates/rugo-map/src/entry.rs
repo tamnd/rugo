@@ -1,12 +1,14 @@
 //! How one cached entry is laid out in arena bytes.
 //!
 //! ```text
-//! [flags:u8][klen:varint][vlen:varint][key][value][expiry:u32?][user flags:u32?]
+//! [flags:u8][klen:varint?][vlen:varint][key][value][expiry:u32?][user flags:u32?]
 //! ```
 //!
 //! Everything optional is at the end, so key and value stay adjacent to their lengths and a `GET` reads one contiguous run. The two trailing fields are present only when the flags byte says so, which is what keeps an entry with no expiry from paying four bytes to say it has none. Most cache entries have no expiry, and every one of them would have paid.
 //!
-//! Lengths are LEB128, so a key under 128 bytes costs one byte to describe and a value under 128 bytes costs one. The whole header for a typical entry is therefore three bytes: one flags, one key length, one value length. Pogocache's is one byte plus its own varints, and then it pays the system allocator's header on top, which is the difference [`rugo_arena`] exists to remove.
+//! Lengths are LEB128, so a value under 128 bytes costs one byte to describe. The key length is not a byte of its own at all for a key of sixty-two bytes or less: the flags byte needs two bits and has eight, and six bits are enough to say how long nearly every cache key is. Longer keys set the field to zero and put a varint after the flags byte, the way they always did.
+//!
+//! The whole header for a typical entry is therefore two bytes: one flags byte carrying the key length, and one value length. Pogocache's is one byte plus its own varints, and then it pays the system allocator's header on top, which is the difference [`rugo_arena`] exists to remove.
 //!
 //! Nothing here stores the hash. Re-reading the key to confirm a match costs a comparison that the control byte has already made unlikely, and storing three bytes of hash per entry to avoid it, which is what pogocache does, is three bytes rugo would rather not spend.
 
@@ -15,6 +17,14 @@ pub(crate) const HAS_EXPIRY: u8 = 1 << 0;
 
 /// Set when the entry carries a memcache-style user flags word.
 pub(crate) const HAS_USER_FLAGS: u8 = 1 << 1;
+
+/// How far up the flags byte the key length sits.
+const KLEN_SHIFT: u32 = 2;
+
+/// The longest key the flags byte can carry.
+///
+/// Six bits hold sixty-four values, one of which is spent on saying that the key is too long to be here, so the range is zero to sixty-two. Memcache's own key limit is two hundred and fifty and Redis has none, so the escape is not a corner case that can be ignored, but a cache key long enough to need it is rare enough that paying a varint for it costs nothing on any workload anybody runs.
+const KLEN_INLINE: usize = 62;
 
 /// How many bytes the LEB128 encoding of `value` takes.
 #[inline]
@@ -65,6 +75,38 @@ pub(crate) fn get_varint(from: &[u8]) -> (usize, usize) {
     }
 }
 
+/// How many bytes the key length costs, which is none at all when the flags byte can carry it.
+#[inline]
+const fn klen_len(klen: usize) -> usize {
+    if klen <= KLEN_INLINE {
+        0
+    } else {
+        varint_len(klen)
+    }
+}
+
+/// The flags byte for an entry with these parts.
+///
+/// One place rather than two, because a reader that disagreed with the writer about which bits are the key length would not fail a bounds check, it would return somebody else's bytes as a key.
+#[inline]
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "the branch has already established that the length is at most KLEN_INLINE, which is under u8::MAX"
+)]
+const fn flags_of(klen: usize, expiry: bool, user_flags: bool) -> u8 {
+    let mut flags = 0u8;
+    if expiry {
+        flags |= HAS_EXPIRY;
+    }
+    if user_flags {
+        flags |= HAS_USER_FLAGS;
+    }
+    if klen <= KLEN_INLINE {
+        flags |= ((klen + 1) as u8) << KLEN_SHIFT;
+    }
+    flags
+}
+
 /// How many bytes an entry with these parts occupies.
 #[inline]
 #[must_use]
@@ -74,7 +116,7 @@ pub(crate) const fn size_of_entry(
     expiry: bool,
     user_flags: bool,
 ) -> usize {
-    1 + varint_len(klen)
+    1 + klen_len(klen)
         + varint_len(vlen)
         + klen
         + vlen
@@ -90,17 +132,11 @@ pub(crate) fn write(
     expiry: Option<u32>,
     user_flags: Option<u32>,
 ) {
-    let mut flags = 0u8;
-    if expiry.is_some() {
-        flags |= HAS_EXPIRY;
-    }
-    if user_flags.is_some() {
-        flags |= HAS_USER_FLAGS;
-    }
-
-    into[0] = flags;
+    into[0] = flags_of(key.len(), expiry.is_some(), user_flags.is_some());
     let mut at = 1;
-    at += put_varint(&mut into[at..], key.len());
+    if key.len() > KLEN_INLINE {
+        at += put_varint(&mut into[at..], key.len());
+    }
     at += put_varint(&mut into[at..], value.len());
     into[at..at + key.len()].copy_from_slice(key);
     at += key.len();
@@ -201,7 +237,12 @@ impl Head {
 #[inline]
 pub(crate) fn head(bytes: &[u8]) -> Head {
     let flags = bytes[0];
-    let (klen, one) = get_varint(&bytes[1..]);
+    let packed = (flags >> KLEN_SHIFT) as usize;
+    let (klen, one) = if packed == 0 {
+        get_varint(&bytes[1..])
+    } else {
+        (packed - 1, 0)
+    };
     let (vlen, two) = get_varint(&bytes[1 + one..]);
     Head {
         flags,
@@ -306,9 +347,66 @@ mod tests {
     }
 
     #[test]
-    fn the_header_of_an_ordinary_entry_is_three_bytes() {
-        // The claim the layout is for. A twenty byte key and a hundred byte value with no expiry costs three bytes to describe, and there is no allocator header underneath it.
-        assert_eq!(size_of_entry(20, 100, false, false), 20 + 100 + 3);
+    fn the_header_of_an_ordinary_entry_is_two_bytes() {
+        // The claim the layout is for. A twenty byte key and a hundred byte value with no expiry costs two bytes to describe, and there is no allocator header underneath it.
+        assert_eq!(size_of_entry(20, 100, false, false), 20 + 100 + 2);
+    }
+
+    #[test]
+    fn a_key_the_flags_byte_cannot_carry_pays_a_varint_and_still_round_trips() {
+        // Both sides of the escape, one byte apart, because an off-by-one here reads the key length out of the wrong place and returns the wrong bytes rather than failing.
+        for klen in [
+            0usize,
+            1,
+            KLEN_INLINE - 1,
+            KLEN_INLINE,
+            KLEN_INLINE + 1,
+            200,
+        ] {
+            let key = vec![b'k'; klen];
+            let value = b"value".to_vec();
+            let described = if klen <= KLEN_INLINE {
+                0
+            } else {
+                varint_len(klen)
+            };
+            assert_eq!(
+                size_of_entry(klen, value.len(), false, false),
+                klen + value.len() + 2 + described,
+                "a key of {klen} bytes costs the wrong header"
+            );
+
+            let size = size_of_entry(klen, value.len(), false, false);
+            let mut buf = vec![0u8; size];
+            write(&mut buf, &key, &value, None, None);
+            let head = head(&buf);
+            assert_eq!(head.size(), size, "{klen} disagreed about its own length");
+            assert_eq!(head.key(&buf), &key[..], "{klen} came back as a wrong key");
+            assert_eq!(head.value(&buf), &value[..], "{klen} lost its value");
+        }
+    }
+
+    #[test]
+    fn the_key_length_and_the_two_flag_bits_do_not_overwrite_each_other() {
+        // The bits share a byte, so a key length that ran into the low bits would turn an ordinary entry into one that claims an expiry it does not have, and the reader would take four bytes of the value as a timestamp.
+        for klen in 0..=KLEN_INLINE {
+            for (expiry, user_flags) in [
+                (None, None),
+                (Some(1234u32), None),
+                (None, Some(0xdead_beefu32)),
+                (Some(1234), Some(0xdead_beef)),
+            ] {
+                let key = vec![b'k'; klen];
+                let size = size_of_entry(klen, 3, expiry.is_some(), user_flags.is_some());
+                let mut buf = vec![0u8; size];
+                write(&mut buf, &key, b"abc", expiry, user_flags);
+                let view = head(&buf).view(&buf);
+                assert_eq!(view.key, &key[..], "{klen} came back wrong");
+                assert_eq!(view.value, b"abc");
+                assert_eq!(view.expiry, expiry, "{klen} lost its expiry");
+                assert_eq!(view.user_flags, user_flags, "{klen} lost its user flags");
+            }
+        }
     }
 
     #[test]

@@ -3,6 +3,8 @@
 //! The unit tests in the crate check that each command computes the right answer. This checks that the answer reaches a client in the spelling a Redis client expects, which is a different claim and the one a benchmark depends on. Everything here goes over a unix socket to a server started the way the binary starts one, and every assertion is on the exact bytes on the wire rather than on a parsed value, because a reply that parses is not the same as a reply that is right.
 //!
 //! `redis-cli` proves the same thing once, on one machine, to whoever was watching. This proves it on every push, on three operating systems.
+//!
+//! Every test here is skipped under Miri. A real socket is the whole point of the file and Miri has no kernel to open one against, so the interpreter would stop the program rather than fail an assertion, which says nothing about the code.
 
 // `clippy.toml` allows these in tests, but that allowance only reaches items inside a `#[cfg(test)]` module or a `#[test]` function, and the helpers below are neither: they are ordinary functions in a crate that happens to be a test. The reasoning is the same one `clippy.toml` gives — a test that cannot fail loudly has to invent a way to fail, and the inventions are worse.
 #![expect(
@@ -184,6 +186,7 @@ impl Client {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "Miri has no kernel to open a socket against")]
 fn the_string_commands_answer_the_way_redis_answers() {
     let mut client = talking();
 
@@ -229,6 +232,7 @@ fn the_string_commands_answer_the_way_redis_answers() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "Miri has no kernel to open a socket against")]
 fn set_takes_the_options_redis_gives_it() {
     let mut client = talking();
 
@@ -271,6 +275,7 @@ fn set_takes_the_options_redis_gives_it() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "Miri has no kernel to open a socket against")]
 fn keys_can_be_counted_expired_and_taken_away() {
     let mut client = talking();
 
@@ -321,6 +326,7 @@ fn keys_can_be_counted_expired_and_taken_away() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "Miri has no kernel to open a socket against")]
 fn a_connection_can_greet_and_go() {
     let mut client = talking();
 
@@ -342,6 +348,7 @@ fn a_connection_can_greet_and_go() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "Miri has no kernel to open a socket against")]
 fn resp3_spells_the_replies_that_differ() {
     let mut client = talking();
     let version = env!("CARGO_PKG_VERSION");
@@ -383,6 +390,7 @@ fn resp3_spells_the_replies_that_differ() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "Miri has no kernel to open a socket against")]
 fn the_admin_commands_answer_something_every_client_can_read() {
     let mut client = talking();
     client.ask(&["SET", "k", "v"], "+OK\r\n");
@@ -430,6 +438,7 @@ fn the_admin_commands_answer_something_every_client_can_read() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "Miri has no kernel to open a socket against")]
 fn inline_commands_and_pipelines_arrive_the_way_they_were_sent() {
     let mut client = talking();
 
@@ -455,6 +464,7 @@ fn inline_commands_and_pipelines_arrive_the_way_they_were_sent() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "Miri has no kernel to open a socket against")]
 fn a_reply_too_big_for_the_socket_arrives_whole() {
     // The path where a turn wants something different from what the poller is already doing, which is the only path that still re-registers a descriptor.
     //
@@ -491,6 +501,7 @@ fn a_reply_too_big_for_the_socket_arrives_whole() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "Miri has no kernel to open a socket against")]
 fn a_command_this_server_does_not_have_is_an_error_rather_than_a_silence() {
     let mut client = talking();
 
@@ -511,6 +522,7 @@ fn a_command_this_server_does_not_have_is_an_error_rather_than_a_silence() {
 // It skips where there is no ring. A container's seccomp profile has the last word on whether the syscall is allowed, and a test that fails inside one is a test that gets deleted.
 #[cfg(target_os = "linux")]
 #[test]
+#[cfg_attr(miri, ignore = "Miri has no kernel to open a socket against")]
 fn the_ring_answers_what_the_poller_answers() {
     if !rugo_net::uring::Ring::available() {
         return;

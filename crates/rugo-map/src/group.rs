@@ -157,9 +157,14 @@ mod imp {
     /// Start fetching the cache line holding `at` into L1.
     ///
     /// `core::arch::aarch64::_prefetch` is not stable, so this is the instruction it would emit, written out. `pldl1keep` is a load into L1 with the line kept for reuse, which is what a slot about to be read wants.
+    ///
+    /// Under Miri it does nothing at all. Miri cannot run inline assembly and stops the whole interpreted program when it meets some, so leaving this in would mean no test that reaches a lookup could be interpreted on an ARM machine, which is every test worth interpreting. A hint that is dropped changes how fast the program runs and nothing else, so the thing Miri is checking is the same either way.
     #[inline]
     pub(crate) fn prefetch(at: *const u8) {
+        #[cfg(miri)]
+        let _ = at;
         // SAFETY: `prfm` is a hint. It never faults, never traps on an unmapped or misaligned address, and has no architectural effect other than on the cache, so any value of `at` is sound. `nostack` and `readonly` say the same thing to the compiler, and `at` is only read as an address.
+        #[cfg(not(miri))]
         unsafe {
             core::arch::asm!("prfm pldl1keep, [{at}]", at = in(reg) at, options(nostack, readonly, preserves_flags));
         }

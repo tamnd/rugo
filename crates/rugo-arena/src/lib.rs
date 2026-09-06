@@ -567,6 +567,20 @@ impl Arena {
     }
 }
 
+/// A count in a test, divided down to what Miri can finish.
+///
+/// The unsafe in this crate is what the interpreter is here for, and a run that is killed at a timeout says nothing about it, so the counts that would not finish are divided rather than left to be cut off. Dividing is sound because none of them is the claim: what two hundred thousand allocations buy is a run that filled many segments, abandoned many tails, took blocks back off several free lists and crossed the boundaries where a mistaken segment number would read another block's bytes, and two thousand reach every one of those, because they are properties of the size classes and the segment growth rule rather than of the number of allocations. A few tests here are skipped instead, and each says at the test why a smaller version of it would assert nothing.
+///
+/// Four is the floor, because a count divided to one or nought is a test that stopped testing rather than a test that got smaller.
+#[cfg(test)]
+const fn fewer(count: usize) -> usize {
+    if cfg!(miri) {
+        if count / 100 < 4 { 4 } else { count / 100 }
+    } else {
+        count
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -665,12 +679,15 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "a slack ratio that needs both of its numbers")]
     #[expect(
         clippy::cast_precision_loss,
         reason = "a slack ratio over byte counts far under 2^52"
     )]
     fn the_growth_rule_holds_little_in_reserve() {
         // The fault this replaced: under doubling the newest segment was as large as all the earlier ones together, so an arena held nearly twice what it had handed out and the memory gate failed by a factor of two.
+        //
+        // Skipped under Miri rather than divided the way the counts around it are, because this one has two numbers and they have to move together. The quarter megabyte is there to skip the first few segments, where slack is naturally high and says nothing about the growth rule, and a divided count never reaches it, so the assertion would run over no samples at all and pass whatever the rule did.
         let mut arena = Arena::new();
         let mut at_worst = 0.0f64;
         for len in 0..200_000usize {
@@ -742,7 +759,7 @@ mod tests {
         // The bug this catches is an off-by-one in the bump or in the segment straddle check, which does not show up as a crash but as one key quietly overwriting another.
         let mut arena = Arena::new();
         let mut refs = Vec::new();
-        for i in 0..200_000usize {
+        for i in 0..fewer(200_000) {
             let len = 1 + (i * 7) % 400;
             let at = arena.alloc(len).unwrap();
             arena.get_mut(at, len).fill(u8::try_from(i % 251).unwrap());
@@ -939,8 +956,11 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "a slack ratio that needs its million entries")]
     fn the_slack_over_a_million_entries_is_small() {
         // Tails, rounding and the segment list together. Pogocache pays a malloc header of eight to sixteen bytes on each of these, which at a hundred byte entry is eight to sixteen per cent.
+        //
+        // Skipped under Miri rather than divided, for the reason the name gives. Three per cent of slack is a figure that only means anything once the segments are large and the fixed costs have been amortised over a great many entries, and an arena with ten thousand in it holds proportionally far more than that without anything being wrong.
         let mut arena = Arena::new();
         for i in 0..1_000_000usize {
             let _ = arena.alloc(90 + i % 20);

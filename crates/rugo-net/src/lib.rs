@@ -446,6 +446,9 @@ pub fn share_port(_fd: RawFd) -> io::Result<()> {
     Ok(())
 }
 
+/// Every test here is skipped under Miri.
+///
+/// They all open a socket, and Miri has no kernel behind one, so it stops the interpreted program on the first `kqueue` or `epoll_create1` rather than failing an assertion. A stopped program says nothing about the code, and skipping is the honest way to say that this crate is not what the interpreter is here for. What it is here for is the unsafe code in the map and the arena, which no test in this file reaches.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -455,6 +458,7 @@ mod tests {
     use std::time::Duration;
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri has no kernel to open a socket against")]
     fn a_poller_reports_a_socket_that_has_something_to_read() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
@@ -488,6 +492,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri has no kernel to open a socket against")]
     fn a_closed_peer_is_reported_as_gone() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
@@ -509,6 +514,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri has no kernel to open a socket against")]
     fn a_removed_socket_stops_waking_it() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
@@ -531,6 +537,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri has no kernel to open a socket against")]
     fn a_listener_is_watched_the_same_way_a_connection_is() {
         // The accept path, which is the one that has to work before anything else does.
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -554,6 +561,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri has no kernel to open a socket against")]
     fn asking_for_a_write_reports_one_immediately() {
         // An empty socket buffer is always writable, so this is the check that the write filter is installed and enabled rather than merely present.
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();

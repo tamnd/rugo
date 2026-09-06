@@ -151,18 +151,20 @@ mod tests {
         let held = lock.lock();
         assert!(lock.try_lock().is_none());
         drop(held);
-        assert!(lock.try_lock().is_some());
+        // `lock` rather than a second `try_lock` on the way back. A weak exchange is allowed to fail when nothing at all is wrong, and this test used to assert that it does not, which is a claim the lock never made: what a free lock owes a caller is that taking it finishes, not that the first attempt does. Real hardware takes that permission up so rarely that the assertion held for as long as nobody looked, and Miri, which fails a weak exchange at random on purpose, is what looked. `lock` is the caller that asks for the thing actually promised, and it reaches the same `try_lock` to get it.
+        drop(lock.lock());
     }
 
     #[test]
     fn nothing_is_lost_under_contention() {
         // Every increment has to survive. A lost update here is the shape of the bug that a missing acquire or release would cause in the map, where it would show up as an entry that half exists.
+        let each = u64::from(crate::fewer(20_000));
         let lock = Arc::new(Lock::new(0u64));
         let threads: Vec<_> = (0..8)
             .map(|_| {
                 let lock = Arc::clone(&lock);
                 thread::spawn(move || {
-                    for _ in 0..20_000 {
+                    for _ in 0..each {
                         *lock.lock() += 1;
                     }
                 })
@@ -171,7 +173,7 @@ mod tests {
         for thread in threads {
             thread.join().unwrap();
         }
-        assert_eq!(*lock.lock(), 8 * 20_000);
+        assert_eq!(*lock.lock(), 8 * each);
     }
 
     #[test]

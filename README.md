@@ -80,6 +80,8 @@ The floor is Rust 1.94 and the pinned toolchain is 1.98. Edition 2024.
 
 `cargo xtask load` drives a running server so that one build can be compared with another on a quiet box, without provisioning seven other servers first. It answers a much smaller question than the harness does and its numbers are rugo against rugo only, so nothing from it goes in `SCOREBOARD.md` or in a claim about a rival.
 
+`cargo xtask ab` is that comparison done properly. It takes two server command lines, starts them one at a time in alternation, drives each with the same load, and reports the middle and the least of what each cost. It reads the generator's own processor time an operation beside the server's, because a difference in the server's cost means something only when the generator's cost stayed put, and it says which of three things happened: one build is cheaper, the difference is inside what the box moves by on its own, or both sides moved together and what was measured was the machine.
+
 Unsafe is not banned here, because a SIMD probe and a slab arena cannot be written without it. What stands in for a ban is a safety comment on every block, denied by lint, plus Miri under both borrow models, loom on the shard lock and two fuzz targets, all of which run nightly in `deep.yml`.
 
 [CHANGELOG.md](CHANGELOG.md) is what each release changed and what it costs you. [RELEASING.md](RELEASING.md) is what the version numbers mean. [PERFORMANCE.md](PERFORMANCE.md) is the optimisations that were written and measured and thrown away, which is the half of the work that otherwise gets done twice.

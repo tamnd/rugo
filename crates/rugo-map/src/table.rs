@@ -133,6 +133,26 @@ impl Table {
         self.slots.len() / WIDTH
     }
 
+    /// How many groups the control array holds, for a caller outside this module.
+    #[must_use]
+    pub const fn groups_count(&self) -> usize {
+        self.groups()
+    }
+
+    /// Where the control bytes start.
+    ///
+    /// For [`crate::Map::warm`], which wants the address of a line and not the bytes in it. Nothing is read through this pointer here and nothing may be read through it elsewhere: the table it points into is only sound to touch under the shard's lock, and the whole reason this exists is to name a line without taking one.
+    #[must_use]
+    pub fn ctrl_at(&self) -> *const u8 {
+        self.ctrl.as_ptr()
+    }
+
+    /// Where the slots start, under the same terms as [`Table::ctrl_at`].
+    #[must_use]
+    pub fn slots_at(&self) -> *const u32 {
+        self.slots.as_ptr()
+    }
+
     /// Read the group starting at slot `at`, which must be a multiple of [`WIDTH`].
     #[inline]
     fn group_at(&self, at: usize) -> Group {
@@ -213,6 +233,23 @@ impl Table {
             }
             group = (group + step) & mask;
             step += 1;
+        }
+    }
+
+    /// Ask for the entry this key's first probe will read, without reading it.
+    ///
+    /// The second half of what [`crate::Map::warm`] starts. That one hints at the index, which is the pair of lines whose addresses are known from the hash alone. This one is what can only be done once the index has arrived: read the lane, and hint at the entry the lane points to.
+    ///
+    /// Only the first group, and only the first lane in it that matches the tag. A tag that matches the wrong key hints at the wrong entry, and a probe that runs into a second group is not hinted at at all. Both are rare, and both cost a hint that turns out to be worth nothing rather than an answer that is wrong.
+    pub fn warm_entry(&self, hash: u64) {
+        if self.slots.is_empty() {
+            return;
+        }
+        let mask = self.groups() - 1;
+        let base = group_of(hash, mask) * WIDTH;
+        if let Some(lane) = self.group_at(base).match_byte(tag_of(hash)).next() {
+            let at = Ref::from_bits(self.slots[base + lane]);
+            prefetch(self.arena.peek(at, MAX_HEADER).as_ptr());
         }
     }
 

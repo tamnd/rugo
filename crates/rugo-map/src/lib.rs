@@ -60,6 +60,12 @@ struct Shard {
     charged: AtomicUsize,
     /// The slot a background sweep should resume at.
     sweep_at: AtomicUsize,
+    /// Where a probe of this shard reads first, so somebody can ask for those lines without taking the lock.
+    ///
+    /// Three numbers: the control array, the slot array, and how many groups there are. They change only when a table is rebuilt, which is once every few thousand writes, and they are read by [`Map::warm`], which does nothing with them but hand them to a prefetch hint.
+    ///
+    /// Reading them without the lock is sound because nothing is dereferenced. A hint is not a load: on every target this builds for, a prefetch of an address that is unmapped, misaligned or nonsense is dropped rather than faulting. So the worst a torn read can do is warm a line nobody wanted, and the cost of preventing that would be a lock, which is the thing being avoided.
+    warm: [AtomicUsize; 3],
 }
 
 impl Shard {
@@ -72,6 +78,13 @@ impl Shard {
         self.resident
             .store(table.resident_bytes(), Ordering::Relaxed);
         self.charged.store(table.charged_bytes(), Ordering::Relaxed);
+        // Only when the table moved, which is when it was rebuilt. The comparison is a load of a line this core already has and a branch that predicts perfectly, and it keeps three stores off every read.
+        let ctrl = table.ctrl_at() as usize;
+        if self.warm[0].load(Ordering::Relaxed) != ctrl {
+            self.warm[1].store(table.slots_at() as usize, Ordering::Relaxed);
+            self.warm[2].store(table.groups_count(), Ordering::Relaxed);
+            self.warm[0].store(ctrl, Ordering::Relaxed);
+        }
     }
 }
 
@@ -123,6 +136,7 @@ impl Map {
                     resident: AtomicUsize::new(0),
                     charged: AtomicUsize::new(0),
                     sweep_at: AtomicUsize::new(0),
+                    warm: [const { AtomicUsize::new(0) }; 3],
                 })
                 .collect(),
             shard_shift,
@@ -187,6 +201,44 @@ impl Map {
         let out = each(&mut table, now);
         shard.publish(&table);
         out
+    }
+
+    /// Ask the memory system for the lines a [`Map::get`] of `key` is about to read, without reading them and without taking the lock.
+    ///
+    /// A lookup is three loads that depend on each other: the control bytes say which lane, the lane says which slot, the slot says where the entry is. At a working set past the last level of cache each of those is a miss, and because each address comes out of the load before it, the misses cannot overlap. Three hundred cycles of memory latency three times over is most of what a lookup costs, and it is latency rather than work, so no amount of making the code shorter touches it.
+    ///
+    /// What does touch it is asking earlier. A server holding a pipeline of twenty-five commands knows all twenty-five keys before it runs any of them, so it can ask for the first two lines of every one of them and then run the lot, and the misses that used to happen one after another happen at the same time. This is that ask. It hashes the key, reads the shard's published hint, and issues two hints. It takes no lock, so it may hint at a line that has just been rebuilt away, and that is why nothing is read through it.
+    ///
+    /// Calling it and then not calling [`Map::get`] is wasteful but harmless. Calling [`Map::get`] without it gives the same answer, more slowly.
+    pub fn warm(&self, key: &[u8]) {
+        let hash = self.hash(key);
+        let shard = &self.shards[self.shard_of(hash)];
+        let groups = shard.warm[2].load(Ordering::Relaxed);
+        if groups == 0 {
+            // Nothing has been written to this shard, so there is no table to warm.
+            return;
+        }
+        // The same group the probe will start at, computed the same way `table::group_of` computes it, through conversions that cannot truncate rather than a cast that could.
+        let mask = u64::try_from(groups - 1).unwrap_or(0);
+        let group = usize::try_from(hash & mask).unwrap_or(0);
+        let ctrl = shard.warm[0].load(Ordering::Relaxed);
+        let slots = shard.warm[1].load(Ordering::Relaxed);
+        group::prefetch(core::ptr::without_provenance(
+            ctrl.wrapping_add(group * group::WIDTH),
+        ));
+        group::prefetch(core::ptr::without_provenance(
+            slots.wrapping_add(group * group::WIDTH * size_of::<u32>()),
+        ));
+    }
+
+    /// Ask for the entry [`Map::get`] will read, which needs the index [`Map::warm`] asked for.
+    ///
+    /// Takes the lock, because reading a lane is reading the table. What it does under it is one group's worth of comparison and a hint, which is the shortest critical section in the map.
+    pub fn warm_entry(&self, key: &[u8]) {
+        let hash = self.hash(key);
+        let shard = &self.shards[self.shard_of(hash)];
+        let table = shard.lock.lock();
+        table.warm_entry(hash);
     }
 
     /// The value under `key`, passed to `each` while the shard is still locked.
@@ -560,6 +612,47 @@ mod tests {
 
     fn get(map: &Map, key: &[u8]) -> Option<Vec<u8>> {
         map.get(key, <[u8]>::to_vec)
+    }
+
+    #[test]
+    fn asking_early_does_not_change_any_answer() {
+        // The whole safety claim of the two hints is that they are hints: they read nothing, they take nothing, and a map that has been warmed answers exactly as one that has not. So this warms every key, including a table that has been rebuilt underneath the hint since it was published, and then asks for all of them.
+        let map = map();
+        for i in 0..20_000u32 {
+            map.set(
+                format!("k{i}").as_bytes(),
+                format!("v{i}").as_bytes(),
+                None,
+                None,
+            )
+            .unwrap();
+        }
+        for i in 0..20_000u32 {
+            let key = format!("k{i}");
+            map.warm(key.as_bytes());
+            map.warm_entry(key.as_bytes());
+            assert_eq!(
+                get(&map, key.as_bytes()).as_deref(),
+                Some(format!("v{i}").as_bytes()),
+                "warming key {i} changed what it answered"
+            );
+        }
+    }
+
+    #[test]
+    fn asking_early_for_something_that_is_not_there_is_allowed() {
+        // Three cases that each name a line the hint cannot have: a shard nobody has written to has no table at all, a key that was never set has no entry, and a key that was removed has an entry that is gone. None of them is an error and none of them may read anything.
+        let map = map();
+        map.warm(b"nothing has ever been written here");
+        map.warm_entry(b"nothing has ever been written here");
+        map.set(b"present", b"yes", None, None).unwrap();
+        map.warm(b"absent");
+        map.warm_entry(b"absent");
+        assert_eq!(get(&map, b"absent"), None);
+        assert!(map.remove(b"present"));
+        map.warm(b"present");
+        map.warm_entry(b"present");
+        assert_eq!(get(&map, b"present"), None);
     }
 
     #[test]

@@ -6,10 +6,16 @@
 //!
 //! ```text
 //! cargo build --release --example probe
-//! ./target/release/examples/probe 5120000 8 5000000 4096
+//! ./target/release/examples/probe 5120000 8 5000000 4096 get
 //! ```
 //!
-//! The arguments are entries, value size, lookups and shards, each optional and taken in that order.
+//! The arguments are entries, value size, lookups, shards and what the pass does, each optional and taken in that order.
+//!
+//! # Why the pass is a choice
+//!
+//! Even a loop with no server in it is not only the map. It has to produce a key to look up, and producing five million distinct keys in the shape a benchmark generates them is a sequence step, a remainder and a decimal conversion, none of which the map does. A count taken over the whole loop charges the map for all three.
+//!
+//! So `keys` runs the same loop with the lookup taken out of it and nothing else changed. It is not a measurement of anything on its own; it is the number to subtract, and what is left is the map.
 
 use rugo_map::Map;
 use std::hint::black_box;
@@ -55,6 +61,10 @@ fn main() {
     let value_len = arg(2, 8);
     let lookups = arg(3, 5_000_000);
     let shards = arg(4, 4096);
+    let pass = std::env::args().nth(5).unwrap_or_else(|| "get".to_owned());
+    let keys_only = pass == "keys";
+    // How many keys the pipelined pass asks for before it reads any of them. Taken from the sixth argument so a sweep can find where the returns stop, since the right depth is a property of how many misses the machine will carry at once and not of the map.
+    let depth = usize::try_from(arg(6, 8)).unwrap_or(8).clamp(1, 64);
 
     let value = vec![0xa5_u8; usize::try_from(value_len).unwrap_or(8)];
     let map = Map::with_seed(
@@ -72,18 +82,59 @@ fn main() {
         }
     }
 
-    println!("ready {} entries in {} shards", map.len(), map.shards());
+    println!(
+        "ready {} entries in {} shards, pass is {}",
+        map.len(),
+        map.shards(),
+        if keys_only { "keys" } else { "get" }
+    );
     let _ = std::io::stdout().flush();
     let mut go = String::new();
     let _ = std::io::stdin().lock().read_line(&mut go);
 
     let mut state = 0x243f_6a88_85a3_08d3_u64;
     let mut found = 0_u64;
-    for _ in 0..lookups {
-        state = next(state);
-        key_of(state % entries, &mut key);
-        if map.get(&key, <[u8]>::len).is_some() {
-            found += 1;
+    // `pipe2` asks for the entries as well, which is a second pass over the batch and a second lock each. Whether that pays is the question the two of them are here to answer.
+    let two_stage = pass == "pipe2";
+    if pass == "pipe" || two_stage {
+        // A batch of keys built, then asked for, then looked up. The middle pass is the point: it issues the hints for every key in the batch back to back, so the misses that a serial loop takes one after another are all in flight together.
+        let mut batch: Vec<Vec<u8>> = (0..depth).map(|_| Vec::with_capacity(24)).collect();
+        let mut done = 0_u64;
+        while done < lookups {
+            let this = depth.min(usize::try_from(lookups - done).unwrap_or(depth));
+            for key in batch.iter_mut().take(this) {
+                state = next(state);
+                key_of(state % entries, key);
+            }
+            for key in batch.iter().take(this) {
+                map.warm(key);
+            }
+            if two_stage {
+                for key in batch.iter().take(this) {
+                    map.warm_entry(key);
+                }
+            }
+            for key in batch.iter().take(this) {
+                if map.get(key, <[u8]>::len).is_some() {
+                    found += 1;
+                }
+            }
+            done += u64::try_from(this).unwrap_or(1);
+        }
+    } else if keys_only {
+        for _ in 0..lookups {
+            state = next(state);
+            key_of(state % entries, &mut key);
+            // The key is handed to something opaque so that a compiler which can see nothing reads it does not delete the work of building it, which would leave an empty loop to subtract.
+            found += u64::try_from(black_box(&key).len()).unwrap_or(0);
+        }
+    } else {
+        for _ in 0..lookups {
+            state = next(state);
+            key_of(state % entries, &mut key);
+            if map.get(&key, <[u8]>::len).is_some() {
+                found += 1;
+            }
         }
     }
     println!("{lookups} lookups, {} hit", black_box(found));

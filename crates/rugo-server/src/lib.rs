@@ -44,10 +44,20 @@ use dispatch::Env;
 /// Short enough that the clock a hundred milliseconds of expiry is measured against is never far wrong, and long enough that an idle server with thirty-two threads wakes three hundred times a second in total rather than thirty thousand.
 const IDLE: Duration = Duration::from_millis(100);
 
-/// How many slots a background sweep looks at each idle turn.
+/// How many slots a background sweep looks at, for every millisecond since the last one.
 ///
 /// Expiry is already checked on read, so this is only what reclaims a key nobody asks for again. Small, because it takes a shard's lock to do it.
 const SWEEP: usize = 256;
+
+/// How often a thread reads the clock and takes its slice of the sweep.
+///
+/// The work is about time passing rather than about commands arriving, so it is paced by time. A thread doing four hundred thousand operations a second comes back into its loop tens of thousands of times a second, and doing this on every one of them meant taking a shard lock and reading a few hundred entry headers that often, to look for expiries against a clock that only moves once a second.
+const UPKEEP: Duration = Duration::from_millis(1);
+
+/// The most sweep slices one upkeep may take, however long it has been since the last one.
+///
+/// A thread coming back from an idle stretch owes the sweep everything that stretch was worth, and paying it all at once would hold a shard's lock for as long as that took. The debt is forgiven past this point instead.
+const SLICES: u128 = 16;
 
 /// A listening socket, whichever kind it is.
 #[derive(Debug)]
@@ -294,6 +304,7 @@ impl Worker<'_> {
         let mut free: Vec<usize> = Vec::new();
         // The events, copied out of the poller so that handling one may register another.
         let mut ready: Vec<Ready> = Vec::new();
+        let mut since = Instant::now();
 
         loop {
             ready.clear();
@@ -339,10 +350,26 @@ impl Worker<'_> {
                 }
             }
 
-            // Whether or not anything happened. The clock is what every expiry is measured against, and a thread that only ticked it when it was busy would leave an idle server's keys immortal.
-            self.map.clock().tick();
-            self.map.sweep(SWEEP);
+            self.upkeep(&mut since);
         }
+    }
+
+    /// Read the clock and take a slice of the background sweep, if it is time to.
+    ///
+    /// Called whether or not anything happened, because the clock is what every expiry is measured against and a thread that only ticked it when it was busy would leave an idle server's keys immortal.
+    ///
+    /// `since` is when this last ran. The slice is the sweep's share of every millisecond that has passed, so the slots a thread sweeps in a second is the same whether it came back here ten times or ten thousand.
+    fn upkeep(&self, since: &mut Instant) {
+        let now = Instant::now();
+        let waited = now.duration_since(*since);
+        if waited < UPKEEP {
+            return;
+        }
+        *since = now;
+        self.map.clock().tick();
+        let slices = waited.as_millis().min(SLICES);
+        self.map
+            .sweep(SWEEP.saturating_mul(usize::try_from(slices).unwrap_or(1)));
     }
 
     /// Take one connection from `listener`, if there is one.

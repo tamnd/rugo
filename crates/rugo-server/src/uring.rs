@@ -20,10 +20,11 @@ use std::io;
 use std::net::TcpStream;
 use std::os::fd::{AsRawFd as _, FromRawFd as _, RawFd};
 use std::os::unix::net::UnixStream;
+use std::time::Instant;
 
 use rugo_net::uring::{Done, Ring, Timespec};
 
-use super::{IDLE, Listener, SWEEP, Worker};
+use super::{IDLE, Listener, Worker};
 use crate::conn::{Conn, Step, Stream};
 use crate::dispatch::Env;
 
@@ -127,6 +128,7 @@ impl Worker<'_> {
             nsec: i64::try_from(IDLE.as_nanos()).unwrap_or(i64::MAX),
         };
 
+        let mut since = Instant::now();
         let mut ring = Ring::new(ENTRIES)?;
         for (at, listener) in self.listeners.iter().enumerate() {
             arm_accept(&mut ring, listener.as_raw_fd(), token(ACCEPT, at))?;
@@ -155,9 +157,7 @@ impl Worker<'_> {
                 }
             }
 
-            // Whether or not anything happened, for the reason the readiness loop gives: a thread that only ticked the clock when it was busy would leave an idle server's keys immortal.
-            self.map.clock().tick();
-            self.map.sweep(SWEEP);
+            self.upkeep(&mut since);
         }
     }
 

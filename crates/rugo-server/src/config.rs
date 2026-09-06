@@ -48,12 +48,12 @@ pub enum Asked {
 /// Whether to use `io_uring`, when there is one to use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Uring {
-    /// Use it if the kernel has it, which is the only setting worth defaulting to.
-    #[default]
+    /// Use it if the kernel has it, and fall back to the poller where it does not.
     Auto,
     /// Use it, and fail to start if it is not there.
     Yes,
-    /// Do not, even where it is available. What a comparison between the two backends is run under.
+    /// Do not, even where it is available. The default, until a sweep on a quiet host says the ring is worth having.
+    #[default]
     No,
 }
 
@@ -84,7 +84,7 @@ impl Default for Config {
             unixsocket: None,
             maxmemory: 0,
             shards: shards_for(threads),
-            uring: Uring::Auto,
+            uring: Uring::No,
         }
     }
 }
@@ -114,7 +114,7 @@ Options:
   --threads <n>         serving threads (default: one per core)
   --shards <n>          map shards, rounded up to a power of two (default: 16 a thread)
   --maxmemory <size>    byte ceiling, as a number or with kb/mb/gb (default: none)
-  --uring <auto|yes|no> use io_uring where the kernel has it (default auto)
+  --uring <auto|yes|no> use io_uring where the kernel has it (default no)
   --version             print the version and exit
   --help                print this and exit
 ";

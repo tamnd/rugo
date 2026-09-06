@@ -294,9 +294,11 @@ impl Worker<'_> {
         }
     }
 
-    /// Take every connection waiting on `listener`.
+    /// Take one connection from `listener`, if there is one.
     ///
-    /// Accepting until it blocks rather than once, because every thread was woken for this and only one of them will get anything, and the ones that got nothing have already paid for the wakeup.
+    /// One rather than every. Accepting until the listener blocks looks like the thrifty choice — every thread was woken for this and the ones that get nothing paid for the wakeup anyway — but it is what decides how the whole server is loaded, because a connection stays on the thread that accepted it for its whole life. A benchmark opens its connections in a burst, so the listener is readable with a backlog behind it, and the first thread to wake takes the lot. The rest get a handful each and then idle, and the server runs at a fraction of the cores it was given no matter how many threads it was asked for.
+    ///
+    /// Taking one apiece spreads the burst across whoever is in the poller to receive it, which is what "whoever is free takes the connection" was supposed to mean. The listener is level triggered, so a backlog wakes everybody again immediately and nothing is left waiting. The extra wakeups are paid once, while connections are being established, and the balance they buy is paid back on every command afterwards.
     fn take(
         &self,
         listener: &Listener,
@@ -304,6 +306,7 @@ impl Worker<'_> {
         conns: &mut Vec<Option<Conn>>,
         free: &mut Vec<usize>,
     ) -> io::Result<()> {
+        // A `while let` here is what took the whole backlog onto one thread. The loop remains only so that a socket which cannot be prepared does not cost this thread its turn.
         while let Some(stream) = listener.accept()? {
             if stream.prepare().is_err() {
                 continue;
@@ -328,6 +331,7 @@ impl Worker<'_> {
                 return Err(error);
             }
             self.stats.thread(self.thread).connection();
+            return Ok(());
         }
         Ok(())
     }
@@ -386,6 +390,63 @@ mod tests {
                 line
             })
             .collect()
+    }
+
+    // What decides whether the server uses the cores it was given.
+    //
+    // A connection lives on the thread that accepted it, so how a burst of them is divided up is how the load is divided up for as long as they last. Accepting until the listener blocked gave the whole burst to whichever thread woke first, and measured on `gpc` at sixteen threads that left four threads carrying the work, five of them at three per cent of a core, and the process using four and a half of its sixteen. The contract that prevents it is this one, and it is worth stating where it cannot drift: one call, one connection.
+    #[test]
+    fn a_turn_at_the_listener_takes_one_connection_and_leaves_the_rest() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bound");
+        listener.set_nonblocking(true).expect("non-blocking");
+        let port = listener.local_addr().expect("an address").port();
+        let listeners = vec![Listener::Tcp(listener)];
+
+        let config = Config {
+            threads: 1,
+            port: None,
+            unixsocket: None,
+            ..Config::default()
+        };
+        let map = Map::new(config.shards, config.maxmemory);
+        let stats = Stats::new(1);
+        let worker = Worker {
+            thread: 0,
+            map: &map,
+            stats: &stats,
+            listeners: &listeners,
+            config: &config,
+            started: Instant::now(),
+        };
+
+        // Opened in a burst and held, which is what a benchmark does and what the old code divided up badly.
+        let held: Vec<TcpStream> = (0..3)
+            .map(|_| TcpStream::connect((Ipv4Addr::LOCALHOST, port)).expect("connected"))
+            .collect();
+
+        let poller = Poller::new().expect("a poller");
+        let mut conns: Vec<Option<Conn>> = Vec::new();
+        let mut free: Vec<usize> = Vec::new();
+        let taken = |conns: &Vec<Option<Conn>>| conns.iter().filter(|slot| slot.is_some()).count();
+
+        // Called until all three have been taken rather than a fixed number of times, because how soon a connect reaches the accept queue is the kernel's business and not this test's claim. The claim is on the step size: no single call may take more than one, whenever they arrive.
+        for _ in 0..500 {
+            let before = taken(&conns);
+            worker
+                .take(&listeners[0], &poller, &mut conns, &mut free)
+                .expect("accepted");
+            let after = taken(&conns);
+            assert!(
+                after - before <= 1,
+                "one call took {} connections, which is the burst landing on one thread",
+                after - before
+            );
+            if after == held.len() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        panic!("three connections never arrived, so nothing was proved either way");
     }
 
     #[test]

@@ -78,4 +78,4 @@ The floor is Rust 1.94 and the pinned toolchain is 1.98. Edition 2024.
 
 Unsafe is not banned here, because a SIMD probe and a slab arena cannot be written without it. What stands in for a ban is a safety comment on every block, denied by lint, plus Miri under both borrow models, loom on the shard lock and two fuzz targets, all of which run nightly in `deep.yml`.
 
-[CHANGELOG.md](CHANGELOG.md) is what each release changed and what it costs you. [RELEASING.md](RELEASING.md) is what the version numbers mean.
+[CHANGELOG.md](CHANGELOG.md) is what each release changed and what it costs you. [RELEASING.md](RELEASING.md) is what the version numbers mean. [PERFORMANCE.md](PERFORMANCE.md) is the optimisations that were written and measured and thrown away, which is the half of the work that otherwise gets done twice.

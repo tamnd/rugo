@@ -164,9 +164,21 @@ fn varint_len(mut value: usize) -> usize {
     len
 }
 
+/// How many bytes an entry spends describing itself, restated here for the same reason [`varint_len`] is.
+///
+/// One flags byte, which carries the key length itself for a key of sixty-two bytes or less, and a varint for the value. A longer key spends a varint of its own on top.
+fn header_len(key_len: usize, value_len: usize) -> usize {
+    let described = if key_len <= 62 {
+        0
+    } else {
+        varint_len(key_len)
+    };
+    1 + described + varint_len(value_len)
+}
+
 #[test]
 fn an_entry_costs_its_header_and_nothing_but_the_grain() {
-    // The entry encoding and the allocation grain, and no allowance for anything else. The header is one flags byte and a varint for each of the two lengths, which is exactly predictable, so it is predicted here and subtracted. What is left can only be the rounding up to the grain, and rounding to a grain cannot cost a whole grain.
+    // The entry encoding and the allocation grain, and no allowance for anything else. The header is one flags byte carrying the key length, and a varint for the value, which is exactly predictable, so it is predicted here and subtracted. What is left can only be the rounding up to the grain, and rounding to a grain cannot cost a whole grain.
     //
     // The bound is the crate's own constant rather than the number it currently holds, because a gate written against a literal eight goes on passing after the grain halves and stops being a gate at all.
     //
@@ -174,8 +186,7 @@ fn an_entry_costs_its_header_and_nothing_but_the_grain() {
     let limit = rugo_arena::GRAIN as f64;
     for &(count, value_len, shards) in SHAPES {
         let cost = fill(count, value_len, shards);
-        let key_len = key_of(0).len();
-        let header = 1 + varint_len(key_len) + varint_len(value_len);
+        let header = header_len(key_of(0).len(), value_len);
         let beyond = (cost.live - cost.payload) as f64 / cost.entries as f64;
         let grain = beyond - header as f64;
         println!(
@@ -197,7 +208,7 @@ fn the_grain_costs_half_itself_where_every_length_occurs() {
     let cost = fill_spread(1_000_000, 4096);
     let mut headers = 0usize;
     for n in 0..1_000_000u32 {
-        headers += 1 + varint_len(key_of(n).len()) + varint_len(spread_len(n));
+        headers += header_len(key_of(n).len(), spread_len(n));
     }
     let grain = (cost.live - cost.payload - headers) as f64 / cost.entries as f64;
     let half = rugo_arena::GRAIN as f64 / 2.0;

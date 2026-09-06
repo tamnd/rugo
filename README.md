@@ -76,6 +76,8 @@ The floor is Rust 1.94 and the pinned toolchain is 1.98. Edition 2024.
 
 `cargo test --workspace` is the whole test suite. `cargo xtask scoreboard` regenerates `SCOREBOARD.md` and `cargo xtask check` says whether the committed one is what the generator would write.
 
+`cargo xtask load` drives a running server so that one build can be compared with another on a quiet box, without provisioning seven other servers first. It answers a much smaller question than the harness does and its numbers are rugo against rugo only, so nothing from it goes in `SCOREBOARD.md` or in a claim about a rival.
+
 Unsafe is not banned here, because a SIMD probe and a slab arena cannot be written without it. What stands in for a ban is a safety comment on every block, denied by lint, plus Miri under both borrow models, loom on the shard lock and two fuzz targets, all of which run nightly in `deep.yml`.
 
 [CHANGELOG.md](CHANGELOG.md) is what each release changed and what it costs you. [RELEASING.md](RELEASING.md) is what the version numbers mean. [PERFORMANCE.md](PERFORMANCE.md) is the optimisations that were written and measured and thrown away, which is the half of the work that otherwise gets done twice.

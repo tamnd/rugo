@@ -611,18 +611,20 @@ impl Table {
         (at, removed)
     }
 
-    /// Drop one entry chosen by sampling, for when the cache is over its memory limit.
+    /// Drop one entry chosen by sampling, for when the cache is over its memory limit, never choosing `spare`.
     ///
     /// Two candidates are drawn and the one that expires sooner goes, an entry with no expiry counting as expiring last. This is the two-random rule rather than a true recency order, because maintaining recency costs two links per entry, and two links are sixteen bytes sitting on a five byte slot.
-    pub fn evict_one(&mut self, roll: u64) -> bool {
+    ///
+    /// `spare` is the slot the write that asked for this eviction has just filled. A write that answers `OK` and then throws away what it wrote is worse than a write that leaves the shard over its share, and a single entry larger than the whole share is otherwise the only thing there is to evict. It is safe once the write returns: the next write to this shard passes a different slot, and the oversized entry goes then.
+    pub fn evict_one(&mut self, roll: u64, spare: Option<usize>) -> bool {
         if self.len == 0 {
             return false;
         }
         let capacity = self.slots.len();
         let once = mix(roll);
         let twice = mix(once);
-        let first = self.nearest_full(spot(once, capacity));
-        let second = self.nearest_full(spot(twice, capacity));
+        let first = self.nearest_full(spot(once, capacity), spare);
+        let second = self.nearest_full(spot(twice, capacity), spare);
         let (Some(first), Some(second)) = (first, second) else {
             return false;
         };
@@ -644,12 +646,19 @@ impl Table {
         self.expiry_of(entry, head).unwrap_or(u32::MAX)
     }
 
-    /// The first occupied slot at or after `from`, wrapping once.
-    fn nearest_full(&self, from: usize) -> Option<usize> {
+    /// The first occupied slot at or after `from` that is not `spare`, wrapping once.
+    fn nearest_full(&self, from: usize, spare: Option<usize>) -> Option<usize> {
         let capacity = self.slots.len();
         (0..capacity)
             .map(|step| (from + step) % capacity)
-            .find(|&at| is_full(self.ctrl[at]))
+            .find(|&at| is_full(self.ctrl[at]) && Some(at) != spare)
+    }
+
+    /// Which slot holds `key`, or nothing if it is not here.
+    ///
+    /// What eviction needs to know to spare the entry the write it is serving has just made. It is a probe of a group the write itself has just read, so it costs a comparison rather than a miss, and only a write that is over its budget pays it at all.
+    pub fn slot_of(&mut self, key: &[u8], hash: u64) -> Option<usize> {
+        self.find(key, hash).map(|(at, _)| at)
     }
 
     /// Call `each` with every live entry, expired or not. The table cannot be changed from inside it.
@@ -1018,11 +1027,11 @@ mod tests {
         let mut roll = 0x1234_5678_9abc_def0u64;
         for _ in 0..1000 {
             roll = roll.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
-            assert!(table.evict_one(roll));
+            assert!(table.evict_one(roll, None));
         }
         assert_eq!(table.len(), 0);
         assert!(
-            !table.evict_one(roll),
+            !table.evict_one(roll, None),
             "an empty table has nothing to evict"
         );
     }
@@ -1041,7 +1050,7 @@ mod tests {
         let mut roll = 0x9e37_79b9_7f4a_7c15u64;
         for _ in 0..500 {
             roll = roll.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
-            table.evict_one(roll);
+            table.evict_one(roll, None);
         }
         let mut survived_with_expiry = 0;
         table.for_each(|view| {

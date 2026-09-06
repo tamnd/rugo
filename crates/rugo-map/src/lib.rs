@@ -104,6 +104,8 @@ pub struct Map {
     /// Eviction is enforced per shard, against the lock the write already holds, rather than against a total that every write on every core would have to touch. A single shared counter read and written a million times a second is one cache line moving between every core in the machine, which costs more than the eviction it is deciding about.
     ///
     /// The price is that an unusually full shard evicts sooner than the whole cache being over would justify. With thousands of shards and a hash that spreads, the fullest shard runs within a small factor of the mean, and the shard count is what buys that.
+    ///
+    /// A single entry larger than a whole share is the case where that reasoning runs out, and there eviction gives way rather than the write: the entry is kept and its shard sits over its share until the next write to that shard, which may take it. A cache that answers `OK` and throws the value away is worse than a cache that goes over its ceiling by one entry.
     shard_budget: usize,
     /// The clock expiry is measured against.
     clock: Clock,
@@ -265,7 +267,7 @@ impl Map {
     ///
     /// # Errors
     ///
-    /// [`Full`] when the shard cannot take the entry, which means the process is out of memory. Being over `maxmemory` is not this error: that is what eviction is for, and it happens after the write rather than instead of it.
+    /// [`Full`] when the shard cannot take the entry, which means the process is out of memory. Being over `maxmemory` is not this error: that is what eviction is for, and it happens after the write rather than instead of it. A value too large for its shard's share of the ceiling is stored and keeps that shard over its share, rather than being written and then evicted by its own write.
     pub fn set(
         &self,
         key: &[u8],
@@ -277,7 +279,7 @@ impl Map {
         let budget = self.shard_budget;
         self.with_key(hash, |table, _| {
             let wrote = table.set(key, value, hash, expiry, user_flags)?;
-            evict_to_fit(table, budget, hash);
+            evict_to_fit(table, budget, key, hash);
             Ok(wrote)
         })
     }
@@ -313,7 +315,7 @@ impl Map {
                 Expiry::Keep => held.flatten(),
             };
             let wrote = table.set(key, value, hash, expiry, user_flags)?;
-            evict_to_fit(table, budget, hash);
+            evict_to_fit(table, budget, key, hash);
             Ok(Some(wrote))
         })
     }
@@ -363,7 +365,7 @@ impl Map {
             table
                 .set(key, &text[..wrote], hash, expiry, user_flags)
                 .map_err(|_| Uncounted::Full)?;
-            evict_to_fit(table, budget, hash);
+            evict_to_fit(table, budget, key, hash);
             Ok(next)
         })
     }
@@ -572,23 +574,28 @@ fn digits(into: &mut [u8; 20], value: i64) -> usize {
     len
 }
 
-/// Evict from `table` until it fits in `budget`, seeding the sampler from `hash`.
+/// Evict from `table` until it fits in `budget`, seeding the sampler from `hash` and sparing whatever `key` holds.
+///
+/// The key is spared because the write that called this wrote it, and a write that answers `OK` and then drops what it wrote is a lie a client cannot see. It matters where one entry is larger than a shard's whole share of the ceiling, which is the case where the entry just written is the only thing there is left to evict. The shard sits over its share until the next write to it, which spares a different key and takes this one if the sampler draws it.
+///
+/// A slot number stays valid for the whole loop because erasing an entry marks its slot and moves nothing, and the table is only rehashed after the loop has finished.
 ///
 /// Bounded, because this runs on the thread that just served a `SET` and holds the shard's lock while it does. A client waiting on a reply should not pay for the whole overshoot, and a shard should not be held while somebody else's key waits. Whatever is left over is taken by the next write, and the one after that if it has to be.
 ///
 /// The sampler is seeded from the key's own hash and stepped locally, so it needs no shared state at all. Eviction wants numbers that are spread, not numbers that are unguessable, and a shared generator would be exactly the contended cache line that per-shard accounting exists to avoid.
-fn evict_to_fit(table: &mut Table, budget: usize, hash: u64) {
+fn evict_to_fit(table: &mut Table, budget: usize, key: &[u8], hash: u64) {
     if budget == 0 || table.charged_bytes() <= budget {
         return;
     }
 
+    let spare = table.slot_of(key, hash);
     let mut roll = hash | 1;
     let mut went = 0;
     while table.charged_bytes() > budget && went < 64 {
         roll ^= roll << 13;
         roll ^= roll >> 7;
         roll ^= roll << 17;
-        if !table.evict_one(roll) {
+        if !table.evict_one(roll, spare) {
             break;
         }
         went += 1;
@@ -772,6 +779,37 @@ mod tests {
             map.resident_bytes() < ceiling * 4,
             "{} bytes resident against a ceiling of {ceiling}",
             map.resident_bytes()
+        );
+    }
+
+    #[test]
+    fn a_value_larger_than_a_shard_s_share_is_kept_rather_than_thrown_away() {
+        // Sixty-four megabytes over sixty-four shards is one megabyte a shard, so a two megabyte value is over its shard's whole share the moment it lands. It used to be written, answered for, and then evicted by the write that made it, which is a `SET` that says it worked and a `GET` that says the key is not there.
+        let map = Map::with_seed(64, 64 * 1024 * 1024, SEED);
+        let value = vec![b'v'; 2 * 1024 * 1024];
+        map.set(b"big", &value, None, None).unwrap();
+        assert_eq!(
+            map.get(b"big", <[u8]>::len),
+            Some(value.len()),
+            "the value the cache said it had taken is not there"
+        );
+    }
+
+    #[test]
+    fn an_oversized_value_goes_when_the_next_write_comes() {
+        // The other half of the rule above: the entry is spared by its own write and by nothing else, so the shard is over its share until somebody writes to it again rather than for as long as the entry lives.
+        let map = Map::with_seed(1, 1024 * 1024, SEED);
+        let value = vec![b'v'; 2 * 1024 * 1024];
+        map.set(b"big", &value, None, None).unwrap();
+        assert!(map.charged_bytes() > 1024 * 1024);
+        for i in 0..64u32 {
+            map.set(format!("k{i}").as_bytes(), b"v", None, None)
+                .unwrap();
+        }
+        assert_eq!(
+            map.get(b"big", <[u8]>::len),
+            None,
+            "the oversized entry outlived the writes that should have evicted it"
         );
     }
 

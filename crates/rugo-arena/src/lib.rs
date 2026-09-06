@@ -91,6 +91,11 @@ const OFF_MASK: u32 = (1 << OFF_BITS) - 1;
 /// Segments one shard may have.
 const MAX_SEGMENTS: usize = 1 << SEG_BITS;
 
+/// How many segments an arena holds inside itself rather than behind a pointer.
+///
+/// Four is sixty-four bytes, which is one cache line on every machine rugo is measured on. Why it matters that it is one line, and why four is enough to cover any shard anyone will have, is on [`Arena::head`].
+const INLINE_SEGMENTS: usize = 4;
+
 /// The top bit of a [`Ref`], set when it indexes the oversized table.
 const LARGE: u32 = 1 << 31;
 
@@ -201,8 +206,18 @@ const fn narrow(count: usize) -> u32 {
 /// Not synchronised. The shard's lock is what makes it safe to use, and putting a second lock here would be paying twice for one guarantee.
 #[derive(Debug)]
 pub struct Arena {
-    /// Backing storage, allocated on first use and growing up to [`MAX_SEGMENT`].
-    segments: Vec<Segment>,
+    /// The first [`INLINE_SEGMENTS`] segments, held here rather than behind a pointer.
+    ///
+    /// Resolving a [`Ref`] means finding the segment it names before the entry can be addressed at all, so whatever holds the segments is on the dependent chain of every read: the control bytes give a slot, the slot gives a reference, the reference gives a segment, and only then is there an address to load the entry from. A `Vec` puts that third step in its own heap allocation, one per shard, and four thousand of those are a quarter of a megabyte of scattered cache lines that a workload streaming gigabytes of values through the cache evicts continuously. Measured on `server3` it was twenty-six per cent of the time spent reading an entry, which was itself thirty-one per cent of the server, and all of it was waiting for a line that holds one pointer and one length.
+    ///
+    /// Held in the arena instead, they are in the same allocation as the table that owns it, a few cache lines from the control bytes and the slots the same lookup has just read, and the shard's lock is in front of them. So the line is normally already there.
+    ///
+    /// Four of them, which is sixty-four bytes and one line. Segments start at [`MIN_SEGMENT`] and double, so the fifth is reached only past fifteen megabytes in a single shard, which at the usual few thousand shards is a cache in the tens of gigabytes. Past that they go in `tail` and cost what they cost today.
+    head: [Segment; INLINE_SEGMENTS],
+    /// Segments past the first [`INLINE_SEGMENTS`], which a shard reaches only when it is very large.
+    tail: Vec<Segment>,
+    /// How many segments there are, across `head` and `tail`.
+    made: usize,
     /// The segment new allocations are being cut from.
     seg: u32,
     /// The next unallocated unit within that segment.
@@ -238,7 +253,9 @@ impl Arena {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            segments: Vec::new(),
+            head: [const { Segment::empty() }; INLINE_SEGMENTS],
+            tail: Vec::new(),
+            made: 0,
             seg: 0,
             off: 0,
             free: Vec::new(),
@@ -297,10 +314,10 @@ impl Arena {
         let units = narrow(rounded / GRAIN);
 
         // An allocation may not straddle two segments, because resolving one is a shift and a mask and a straddling block has no single segment to resolve to.
-        let room = self
-            .segments
-            .get(self.seg as usize)
-            .map_or(0, |segment| narrow(segment.len() / GRAIN) - self.off);
+        let room = match self.segment(self.seg as usize) {
+            [] => 0,
+            segment => narrow(segment.len() / GRAIN) - self.off,
+        };
         if room < units {
             // The tail is too short for this request but it is long enough for a smaller one, and the free list is exactly the place that knows about smaller ones. Abandoning it instead would be a fixed loss per segment, which is affordable only if segments are large, and large segments are the floor a four thousand shard cache cannot pay.
             if room > 0 {
@@ -310,7 +327,7 @@ impl Arena {
         }
         // Every segment is at least twice [`SMALL_MAX`], so a fresh one always has room for the largest request the slab serves and one growth is always enough.
         debug_assert!(
-            self.off as usize + units as usize <= self.segments[self.seg as usize].len() / GRAIN
+            self.off as usize + units as usize <= self.segment(self.seg as usize).len() / GRAIN
         );
 
         let at = Self::make(self.seg, self.off);
@@ -321,15 +338,20 @@ impl Arena {
 
     /// Add a segment and cut from it.
     fn grow(&mut self) -> Result<(), Full> {
-        if self.segments.len() >= MAX_SEGMENTS {
+        if self.made >= MAX_SEGMENTS {
             return Err(Full::Slab);
         }
         let segment = Segment::new(next_segment_size(self.segment_bytes)).ok_or(Full::Memory)?;
         // A unit offset is [`OFF_BITS`] wide, so a segment longer than that many grains has bytes no reference could name. [`MAX_SEGMENT`] is chosen to sit exactly on that bound and page rounding cannot move it, because every size the growth rule produces is already a whole number of pages on every platform this runs on.
         debug_assert!(segment.len() / GRAIN <= 1 << OFF_BITS);
         self.segment_bytes += segment.len();
-        self.segments.push(segment);
-        self.seg = narrow(self.segments.len() - 1);
+        if self.made < INLINE_SEGMENTS {
+            self.head[self.made] = segment;
+        } else {
+            self.tail.push(segment);
+        }
+        self.seg = narrow(self.made);
+        self.made += 1;
         self.off = 0;
         Ok(())
     }
@@ -394,6 +416,34 @@ impl Arena {
         self.free[class] = at.0;
     }
 
+    /// The bytes of segment number `seg`, or an empty slice if there is no such segment.
+    ///
+    /// Every read of an entry goes through here. The branch is on a constant and goes the same way every time in any cache anyone will run, so it predicts perfectly and costs nothing; what it buys is that the common side reads out of this struct rather than out of a second allocation.
+    ///
+    /// A segment that does not exist reads as empty rather than as an error, which is what indexing a list past its end did before: the caller then slices it at the offset the reference named and that is where it fails. A reference the arena did not hand out is a bug in the map, not a case to be recovered from.
+    #[inline]
+    fn segment(&self, seg: usize) -> &[u8] {
+        if seg < INLINE_SEGMENTS {
+            &self.head[seg]
+        } else {
+            self.tail
+                .get(seg - INLINE_SEGMENTS)
+                .map_or(&[][..], |segment| &segment[..])
+        }
+    }
+
+    /// The bytes of segment number `seg`, to write into.
+    #[inline]
+    fn segment_mut(&mut self, seg: usize) -> &mut [u8] {
+        if seg < INLINE_SEGMENTS {
+            &mut self.head[seg]
+        } else {
+            self.tail
+                .get_mut(seg - INLINE_SEGMENTS)
+                .map_or(&mut [][..], |segment| &mut segment[..])
+        }
+    }
+
     /// Where a small reference lands: which segment, and how many bytes into it.
     #[inline]
     const fn place(at: Ref) -> (usize, usize) {
@@ -411,7 +461,7 @@ impl Arena {
             return &self.large[(at.0 & !LARGE) as usize];
         }
         let (seg, off) = Self::place(at);
-        &self.segments[seg][off..off + len]
+        &self.segment(seg)[off..off + len]
     }
 
     /// The bytes behind `at`, to write into.
@@ -422,7 +472,7 @@ impl Arena {
             return &mut self.large[(at.0 & !LARGE) as usize];
         }
         let (seg, off) = Self::place(at);
-        &mut self.segments[seg][off..off + len]
+        &mut self.segment_mut(seg)[off..off + len]
     }
 
     /// Up to `len` bytes behind `at`, however many of them are actually there.
@@ -436,7 +486,7 @@ impl Arena {
             return &block[..len.min(block.len())];
         }
         let (seg, off) = Self::place(at);
-        let segment = &self.segments[seg];
+        let segment = self.segment(seg);
         &segment[off..off.saturating_add(len).min(segment.len())]
     }
 
@@ -445,7 +495,7 @@ impl Arena {
     fn next_free(&self, at: Ref) -> u32 {
         let (seg, off) = Self::place(at);
         let mut buf = [0u8; 4];
-        buf.copy_from_slice(&self.segments[seg][off..off + 4]);
+        buf.copy_from_slice(&self.segment(seg)[off..off + 4]);
         u32::from_le_bytes(buf)
     }
 
@@ -453,7 +503,7 @@ impl Arena {
     #[inline]
     fn set_next_free(&mut self, at: Ref, next: u32) {
         let (seg, off) = Self::place(at);
-        self.segments[seg][off..off + 4].copy_from_slice(&next.to_le_bytes());
+        self.segment_mut(seg)[off..off + 4].copy_from_slice(&next.to_le_bytes());
     }
 
     /// Bytes currently handed out, including the rounding up to the grain.
@@ -498,16 +548,19 @@ impl Arena {
             return self.segment_bytes;
         }
         // `seg` always names the last segment: growing appends and nothing ever cuts from an earlier one again.
-        let Some(last) = self.segments.last() else {
+        if self.made == 0 {
             return 0;
-        };
+        }
+        let last = self.segment(self.made - 1);
         let written = (self.off as usize * GRAIN).next_multiple_of(segment::granule());
         self.segment_bytes - last.len() + written.min(last.len())
     }
 
     /// What this arena's own lists cost.
+    ///
+    /// The allocations, not the struct. `head` is sixty-four bytes of the struct itself and is not here for the same reason `live` and `seg` are not: nothing in rugo counts the bytes of a struct its owner already accounts for, and counting one field of one struct would be an inconsistency rather than a correction. It is worth saying out loud that those bytes are real, and that they replace a heap allocation of about the same size that this did count, so a shard with segments in it costs slightly less than it did and reports slightly less than that.
     fn tables(&self) -> usize {
-        self.segments.capacity() * size_of::<Segment>()
+        self.tail.capacity() * size_of::<Segment>()
             + self.large.capacity() * size_of::<Box<[u8]>>()
             + self.large_free.capacity() * size_of::<u32>()
             + self.free.capacity() * size_of::<u32>()
@@ -524,6 +577,33 @@ mod tests {
         let arena = Arena::new();
         assert_eq!(arena.live_bytes(), 0);
         assert_eq!(arena.resident_bytes(), 0);
+    }
+
+    #[test]
+    fn a_shard_that_outgrows_the_inline_segments_still_reads_back() {
+        // Nothing in an ordinary cache reaches the fifth segment, which is exactly why this is here: the branch in `segment` that goes to `tail` would otherwise never run anywhere, and the first thing to run it would be somebody's very large shard in production.
+        //
+        // Every reference is kept and read back at the end rather than as it is made, because the failure this is looking for is one where a later segment displaces an earlier one and the early references start resolving somewhere else.
+        let mut arena = Arena::new();
+        let mut made = Vec::new();
+        let mut fill = 0u8;
+        while arena.made <= INLINE_SEGMENTS {
+            let at = arena.alloc(SMALL_MAX).expect("a slab allocation");
+            arena.get_mut(at, SMALL_MAX).fill(fill);
+            made.push((at, fill));
+            fill = fill.wrapping_add(1);
+        }
+        assert!(
+            arena.made > INLINE_SEGMENTS,
+            "the test never reached a segment held outside the arena"
+        );
+
+        for (at, fill) in made {
+            assert!(
+                arena.get(at, SMALL_MAX).iter().all(|&b| b == fill),
+                "the entry at {at:?} did not read back as it was written"
+            );
+        }
     }
 
     #[test]
@@ -616,10 +696,7 @@ mod tests {
         for _ in 0..(MIN_SEGMENT / 24) * 4 {
             arena.alloc(24).unwrap();
         }
-        assert!(
-            arena.segments.len() > 1,
-            "the test did not fill a single segment"
-        );
+        assert!(arena.made > 1, "the test did not fill a single segment");
         assert!(
             arena.dead_bytes() > 0,
             "no tail reached a free list, so every segment lost one"
@@ -802,7 +879,7 @@ mod tests {
             let at = arena.alloc(len).unwrap();
             let (seg, off) = Arena::place(at);
             assert!(
-                off + len <= arena.segments[seg].len(),
+                off + len <= arena.segment(seg).len(),
                 "allocation {i} runs past the end of segment {seg}"
             );
             arena.get_mut(at, len).fill(1);

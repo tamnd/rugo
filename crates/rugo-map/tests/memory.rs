@@ -254,16 +254,19 @@ fn report_the_numbers_the_scoreboard_quotes() {
             cost.overhead()
         );
     }
-    // The published shape, and the only row here whose value lengths are the harness's rather than one repeated number. It is a tenth of the ten million the sweep fills, because a test that runs on every push cannot hold five gigabytes.
-    let cost = fill_spread(1_000_000, 4096);
-    println!(
-        "{:>7}  {:>5}  {:>6}  {:>13.2}  {:>16.2}",
-        1_000_000,
-        "1-1k",
-        4096,
-        cost.total(),
-        cost.overhead()
-    );
+    // The published shape, and the only rows here whose value lengths are the harness's rather than one repeated number. A million entries rather than the ten million the sweep fills, because a test that runs on every push cannot hold five gigabytes.
+    //
+    // One row per shard count rather than one row, because the shard count is the single largest thing in this table and it does not look like a memory decision at all. Every shard owns an arena, an arena is charged in whole pages, and a part-used last page is a floor a shard pays whether it holds ten entries or ten thousand. So the cost of a shard count is that floor divided by the entries in the map, which is why the spread below is wide at a million entries and would be a tenth of it at ten million, and why it is worth reading the row for the count a server would actually pick rather than the largest one the map allows.
+    for shards in [4096usize, 512, 256, 128, 64] {
+        let cost = fill_spread(1_000_000, shards);
+        println!(
+            "{:>7}  {:>5}  {shards:>6}  {:>13.2}  {:>16.2}",
+            1_000_000,
+            "1-1k",
+            cost.total(),
+            cost.overhead()
+        );
+    }
 }
 
 #[test]

@@ -37,7 +37,7 @@ Options:
   --no-port             do not listen on TCP at all
   --unixsocket <path>   also listen on a unix socket
   --threads <n>         serving threads (default: one per core)
-  --shards <n>          map shards, rounded up to a power of two (default 4096)
+  --shards <n>          map shards, rounded up to a power of two (default: 16 a thread)
   --maxmemory <size>    byte ceiling, as a number or with kb/mb/gb (default: none)
   --uring <auto|yes|no> use io_uring where the kernel has it (default auto)
   --version             print the version and exit

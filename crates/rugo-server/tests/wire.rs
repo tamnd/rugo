@@ -449,6 +449,35 @@ fn inline_commands_and_pipelines_arrive_the_way_they_were_sent() {
 }
 
 #[test]
+fn a_bad_command_in_the_middle_of_a_batch_is_answered_in_its_turn() {
+    // The server reads one command ahead of the one it is answering, so that it can ask for the next key's cache line early. Everything that lookahead sees, it has to keep to itself: a command that is malformed is malformed when the loop reaches it and not before, because the replies in front of it are owed to the client first and the connection hangs up at that point rather than earlier.
+    //
+    // A batch of three where the middle one is an array whose element is not a bulk string. The first reply is owed, the second is the error, and the third command is behind a connection that is already closing and is never run.
+    let mut client = talking();
+    client.ask(&["SET", "before", "here"], "+OK\r\n");
+
+    let mut batch = cmd(&["GET", "before"]);
+    batch.extend_from_slice(b"*2\r\n+GET\r\n+after\r\n");
+    batch.extend_from_slice(&cmd(&["SET", "after", "written"]));
+    client.send(&batch);
+
+    assert_eq!(
+        client.line(),
+        "$4\r\n",
+        "the reply in front of the bad command"
+    );
+    assert_eq!(client.line(), "here\r\n");
+    assert_eq!(
+        client.line(),
+        "-ERR Protocol error: expected '$', got something else\r\n"
+    );
+
+    // The connection is gone, so the third command never ran and a fresh connection cannot see its key.
+    let mut after = talking();
+    after.ask(&["EXISTS", "after"], ":0\r\n");
+}
+
+#[test]
 fn a_reply_too_big_for_the_socket_arrives_whole() {
     // The path where a turn wants something different from what the poller is already doing, which is the only path that still re-registers a descriptor.
     //

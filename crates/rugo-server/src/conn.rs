@@ -122,6 +122,10 @@ pub(crate) struct Conn {
     dialect: Dialect,
     /// The argument list, re-used across every command this connection ever serves.
     command: Command,
+    /// The argument list of the command after that one.
+    ///
+    /// A second list rather than one, so that reading ahead to find the next key does not cost a second parse of the same bytes. See [`Conn::execute`].
+    ahead: Command,
     /// Set when the last reply has been written and the connection should go.
     closing: bool,
     /// What the poller was last told to watch this socket for.
@@ -145,6 +149,7 @@ impl Conn {
             sent: 0,
             dialect: Dialect::default(),
             command: Command::new(),
+            ahead: Command::new(),
             closing: false,
             // What `take` registers a freshly accepted connection for. A connection whose first turn wants exactly this makes no `epoll_ctl` at all.
             armed: Interest::READ,
@@ -248,6 +253,14 @@ impl Conn {
     }
 
     /// Run every whole command in the read buffer.
+    ///
+    /// # Reading one command ahead
+    ///
+    /// A batch arrives whole, so by the time the first command is being answered the bytes of the second are already here. Serving them strictly one at a time wastes that: the probe for the second key cannot start until the first reply has been written, and the first thing that probe does is miss, so the memory system sits idle through the work and then the work sits idle through the miss.
+    ///
+    /// So each command's key is handed to [`Map::warm`] one command early, which asks for the cache line that key's probe will land on and returns without waiting. The fetch then runs underneath the answering of the command in front of it.
+    ///
+    /// The command read ahead is kept rather than parsed twice. `ahead` holds its arguments and `ready` holds its length, and the next turn of the loop takes them instead of parsing. A lookahead that is not a whole command, or is not well formed, is simply not kept: the loop reaches those bytes on its own turn and parses them there, where a partial command means wait for more and a malformed one means say so and hang up. Both answers have to be given in order, and giving them here would give them early.
     fn execute(&mut self, env: &Env<'_>) {
         // Split so the read buffer, the argument list and the reply buffer are three borrows rather than one, which is what lets a command read its arguments out of one and write its answer into another.
         let Self {
@@ -257,15 +270,33 @@ impl Conn {
             out,
             dialect,
             command,
+            ahead,
             closing,
             ..
         } = self;
 
+        // How long the command in `ahead` is, when there is one. Always a command starting at `*at`, because it is set from the command in front of it and dropped whenever the loop stops advancing.
+        let mut ready: Option<usize> = None;
+
         while !*closing && out.len() < MAX_REPLY {
             let rest = &buf[*at..*filled];
-            match rugo_resp::parse(rest, command) {
+            let parsed = if let Some(used) = ready.take() {
+                core::mem::swap(command, ahead);
+                Ok(Parsed::Done(used))
+            } else {
+                rugo_resp::parse(rest, command)
+            };
+            match parsed {
                 Ok(Parsed::Done(used)) => {
                     if !command.is_empty() {
+                        let next = &buf[*at + used..*filled];
+                        if let Ok(Parsed::Done(len)) = rugo_resp::parse(next, ahead) {
+                            // Argument one, which is the key for every command in this server that has one. A command with no arguments has no key to warm and asks for nothing.
+                            if let Some(key) = ahead.arg(1, &next[..len]) {
+                                env.map.warm(key);
+                            }
+                            ready = Some(len);
+                        }
                         // The slice the spans were measured against, which is the one they have to be read out of.
                         let seen = &rest[..used];
                         if dispatch::run(env, command, seen, out, dialect) == Reply::Last {

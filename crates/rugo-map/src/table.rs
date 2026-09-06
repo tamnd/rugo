@@ -129,8 +129,16 @@ impl Table {
 
     /// How many groups the control array holds.
     #[inline]
-    const fn groups(&self) -> usize {
+    pub(crate) const fn groups(&self) -> usize {
         self.slots.len() / WIDTH
+    }
+
+    /// Where the control bytes begin.
+    ///
+    /// Handed out so that a shard can publish it for a reader who will not take the lock and only wants to name a cache line, not read one. Nothing may dereference this: the table it belongs to can rebuild and free it at any moment after the lock is released, and the only use that survives that is a prefetch, which is a hint about an address rather than a read of it.
+    #[inline]
+    pub(crate) fn ctrl_ptr(&self) -> *const u8 {
+        self.ctrl.as_ptr()
     }
 
     /// Read the group starting at slot `at`, which must be a multiple of [`WIDTH`].
@@ -652,7 +660,7 @@ const fn spot(bits: u64, capacity: usize) -> usize {
     clippy::cast_possible_truncation,
     reason = "the mask keeps fewer bits than the narrowest usize has"
 )]
-const fn group_of(hash: u64, mask: usize) -> usize {
+pub(crate) const fn group_of(hash: u64, mask: usize) -> usize {
     (hash as usize) & mask
 }
 

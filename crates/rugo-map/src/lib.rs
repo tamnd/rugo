@@ -31,7 +31,7 @@ mod group;
 pub mod lock;
 pub mod table;
 
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 
 pub use entry::View;
 pub use rugo_arena::Full;
@@ -60,6 +60,14 @@ struct Shard {
     charged: AtomicUsize,
     /// The slot a background sweep should resume at.
     sweep_at: AtomicUsize,
+    /// Where the control bytes begin, as of the last time somebody held the lock.
+    ///
+    /// Null until the shard is first written to, because a table that has never held a key owns no control bytes.
+    ///
+    /// Published for [`Map::warm`], which names a cache line and never reads one. Nothing may dereference this.
+    ctrl: AtomicPtr<u8>,
+    /// How many groups those control bytes hold, as of the same moment.
+    groups: AtomicUsize,
 }
 
 impl Shard {
@@ -72,6 +80,9 @@ impl Shard {
         self.resident
             .store(table.resident_bytes(), Ordering::Relaxed);
         self.charged.store(table.charged_bytes(), Ordering::Relaxed);
+        self.ctrl
+            .store(table.ctrl_ptr().cast_mut(), Ordering::Relaxed);
+        self.groups.store(table.groups(), Ordering::Relaxed);
     }
 }
 
@@ -123,6 +134,8 @@ impl Map {
                     resident: AtomicUsize::new(0),
                     charged: AtomicUsize::new(0),
                     sweep_at: AtomicUsize::new(0),
+                    ctrl: AtomicPtr::new(core::ptr::null_mut()),
+                    groups: AtomicUsize::new(0),
                 })
                 .collect(),
             shard_shift,
@@ -187,6 +200,34 @@ impl Map {
         let out = each(&mut table, now);
         shard.publish(&table);
         out
+    }
+
+    /// Start fetching the first cache line the lookup of `key` will want, without doing the lookup.
+    ///
+    /// A server reading a pipelined batch knows the next key before it has finished with this one. Left alone, the two lookups miss one after the other: the next probe cannot begin until the current command has been answered, so the memory system is idle for most of the time it takes to serve one command and then stalls for the length of a miss at the start of the next. Told about the next key in advance, it fetches that line while the current command is still being served, and by the time the probe runs the line is there.
+    ///
+    /// One line and no more. The chain after it is control bytes, then a slot, then an entry, and each address comes out of the load before it, so nothing further along can be named yet. Naming the first of them is what turns a chain that starts cold into one that starts warm.
+    ///
+    /// The hint asks for L2 rather than L1. A whole command happens between this call and the load it is for, and serving a command copies a value, which streams enough bytes through L1 to throw the line back out before anything reads it. Asked for at L1 the line is fetched twice and the hint is worse than nothing, which is what it measured.
+    ///
+    /// Costs a hash and a hint. Both are cheap enough that this is worth calling for a key that turns out not to be in the map, and both are wasted if the caller does not go on to look the key up.
+    ///
+    /// # How this reads a shard it does not lock
+    ///
+    /// The address it wants belongs to a table behind a lock, and taking that lock to compute a hint would cost more than the hint saves and would serialise on the thing being made faster. So each shard publishes where its control bytes are whenever somebody who does hold the lock puts it down, and this reads that.
+    ///
+    /// What it reads may therefore be out of date, in two ways: the table may have been rebuilt, so the pointer names memory that has been freed, and the group count may belong to a different table than the pointer does, so the offset may fall outside the array. Neither matters, because the value is never dereferenced. It is handed to a prefetch, which is a statement about an address rather than a read of one: the processor is free to ignore it, and an address that is unmapped or nonsense produces no fault and no trap. The worst outcome is a line fetched that nobody wanted, which is the same outcome as guessing the wrong key.
+    pub fn warm(&self, key: &[u8]) {
+        let hash = self.hash(key);
+        let shard = &self.shards[self.shard_of(hash)];
+        let groups = shard.groups.load(Ordering::Relaxed);
+        if groups == 0 {
+            // A shard nobody has written to yet owns no control bytes, and its published pointer is null.
+            return;
+        }
+        let ctrl = shard.ctrl.load(Ordering::Relaxed);
+        let at = table::group_of(hash, groups - 1) * group::WIDTH;
+        group::prefetch_far(ctrl.wrapping_add(at));
     }
 
     /// The value under `key`, passed to `each` while the shard is still locked.

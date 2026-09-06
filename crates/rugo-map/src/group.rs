@@ -164,6 +164,17 @@ mod imp {
             core::arch::asm!("prfm pldl1keep, [{at}]", at = in(reg) at, options(nostack, readonly, preserves_flags));
         }
     }
+
+    /// Start fetching the cache line holding `at` into L2.
+    ///
+    /// `pldl2keep` rather than `pldl1keep`, for the reason on [`super::prefetch_far`].
+    #[inline]
+    pub(crate) fn prefetch_far(at: *const u8) {
+        // SAFETY: as in `prefetch`. Which level of cache is named changes nothing about whether the hint is sound.
+        unsafe {
+            core::arch::asm!("prfm pldl2keep, [{at}]", at = in(reg) at, options(nostack, readonly, preserves_flags));
+        }
+    }
 }
 
 #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
@@ -223,6 +234,15 @@ mod imp {
     pub(crate) fn prefetch(at: *const u8) {
         // SAFETY: `_mm_prefetch` is a hint. It reads nothing and faults on nothing, so any address is sound to pass it, and it is unconditionally available under target_feature = "sse2".
         unsafe { sse::_mm_prefetch::<{ sse::_MM_HINT_T0 }>(at.cast()) }
+    }
+
+    /// Start fetching the cache line holding `at` into L2.
+    ///
+    /// `_MM_HINT_T1` rather than `_MM_HINT_T0`, for the reason on [`super::prefetch_far`].
+    #[inline]
+    pub(crate) fn prefetch_far(at: *const u8) {
+        // SAFETY: as in `prefetch`. Which level of cache is named changes nothing about whether the hint is sound.
+        unsafe { sse::_mm_prefetch::<{ sse::_MM_HINT_T1 }>(at.cast()) }
     }
 }
 
@@ -286,8 +306,18 @@ mod imp {
     pub(crate) fn prefetch(at: *const u8) {
         let _ = at;
     }
+
+    /// As above, and as little.
+    #[inline]
+    pub(crate) fn prefetch_far(at: *const u8) {
+        let _ = at;
+    }
 }
 
+/// Start fetching the cache line holding `at` into a level of cache that will still hold it a while.
+///
+/// [`prefetch`] asks for L1, which is what a line wanted a few instructions later should ask for. This is for a line wanted much further off, and L1 is the wrong place to put that: the work in between streams a value through it and the line is gone before anything reads it, so the hint buys a fetch that has to happen twice. L2 is far enough back to survive that and near enough that reaching it is a fraction of the cost of going to memory.
+pub(crate) use imp::prefetch_far;
 pub(crate) use imp::{Group, WIDTH, prefetch};
 
 #[cfg(test)]

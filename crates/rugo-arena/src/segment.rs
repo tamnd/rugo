@@ -107,6 +107,10 @@ mod platform {
 
     /// Give the mapping back.
     pub(super) fn drop(segment: &mut Segment) {
+        // An empty segment never mapped anything and its pointer is dangling, so it is returned before the pointer is looked at rather than after.
+        if segment.len == 0 {
+            return;
+        }
         // SAFETY: `ptr` and `len` are the address and length of a mapping this segment made in `new` and has not unmapped, and `drop` runs once.
         unsafe {
             libc::munmap(segment.ptr.as_ptr().cast::<libc::c_void>(), segment.len);
@@ -135,6 +139,10 @@ mod platform {
 
     /// Give the box back.
     pub(super) fn drop(segment: &mut Segment) {
+        // An empty segment never took a box and its pointer is dangling, so it is returned before the pointer is looked at rather than after.
+        if segment.len == 0 {
+            return;
+        }
         // SAFETY: `ptr` came from `Box::into_raw` on a `Box<[u8]>` of `len` bytes in `new`, and `drop` runs once, so this reconstructs exactly the box that was taken apart.
         unsafe {
             core::mem::drop(Box::from_raw(core::ptr::slice_from_raw_parts_mut(
@@ -151,6 +159,16 @@ impl Segment {
     /// May be longer than asked for, because a mapping is a whole number of pages. The extra is usable and the caller is told about it by [`Segment::len`], so it is not lost.
     pub(super) fn new(size: usize) -> Option<Self> {
         platform::new(size)
+    }
+
+    /// A segment that owns nothing, for a slot in a fixed array that has not been filled yet.
+    ///
+    /// Zero bytes long, so it dereferences to an empty slice and any offset into it is out of range, which is the same answer an index past the end of the old list of segments gave. It holds no storage, so `drop` has nothing to give back and both platforms say so before they touch the pointer.
+    pub(super) const fn empty() -> Self {
+        Self {
+            ptr: NonNull::dangling(),
+            len: 0,
+        }
     }
 }
 

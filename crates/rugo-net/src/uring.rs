@@ -236,7 +236,7 @@ impl Drop for Mapping {
 
 /// An `io_uring`, and the two rings it is made of.
 ///
-/// One a thread. The ring is not `Sync` and does not want to be: [`SETUP_SINGLE_ISSUER`] is a promise to the kernel that one thread submits, and the whole point of the shape is that a connection belongs to a thread.
+/// One a thread. The ring is not `Sync` and does not want to be: asking the kernel for a single issuer is a promise to the kernel that one thread submits, and the whole point of the shape is that a connection belongs to a thread.
 #[derive(Debug)]
 pub struct Ring {
     /// The ring's descriptor.

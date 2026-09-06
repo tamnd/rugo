@@ -163,7 +163,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@nightly
         with:
           components: miri
-      - uses: taiki-e/install-action@v2.87.3
+      - uses: taiki-e/install-action@v2.87.4
         with:
           tool: cargo-nextest
       - uses: Swatinem/rust-cache@v2.9.2
@@ -235,7 +235,7 @@ jobs:
         with:
           ref: ${{ needs.wanted.outputs.ref }}
       - uses: dtolnay/rust-toolchain@nightly
-      - uses: taiki-e/install-action@v2.87.3
+      - uses: taiki-e/install-action@v2.87.4
         with:
           tool: cargo-fuzz
       - uses: Swatinem/rust-cache@v2.9.2

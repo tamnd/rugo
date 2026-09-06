@@ -42,7 +42,7 @@ use lock::Lock;
 
 /// The most shards a map will make, which is also what the server defaults to.
 ///
-/// Four thousand and ninety-six is pogocache's number, and it is a good one: at sixty-four threads it is sixty-four shards a thread, which is enough that two threads colliding on the same lock is rare, and the whole index of an empty map is still under two megabytes.
+/// Four thousand and ninety-six is pogocache's number, and it is the right ceiling here even though it is no longer the default. The whole index of an empty map is still under two megabytes at that many, and past it a shard is not buying anything a lock needs: what more shards cost is that each one owns an arena, and the more arenas a cache is cut into the further apart the bytes of two consecutive lookups are. The server picks its own count from its thread count, and `rugo-server`'s `shards_for` is where that reasoning is written down.
 pub const MAX_SHARDS: usize = 4096;
 
 /// One shard: a table, its lock, and the counters a reader may look at without taking it.

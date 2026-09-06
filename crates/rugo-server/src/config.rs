@@ -7,8 +7,30 @@ use std::fmt;
 /// The default port, which is Redis's, because every client and every benchmark already knows it.
 pub const DEFAULT_PORT: u16 = 6379;
 
-/// How many shards a map gets when nobody says.
-pub const DEFAULT_SHARDS: usize = 4096;
+/// How many shards a thread gets when nobody says.
+///
+/// A shard count is a trade between two things and the trade is not where it looks. The usual reasoning is that shards exist to keep threads off each other, so more of them is better and the only cost is the empty table each one starts with. That is true of a map whose entries all come from one allocator. It is not true here, where every shard owns its own arena, so the shard count decides how the cache's bytes are laid out as well as how its locks are divided.
+///
+/// Four thousand shards over five million entries is seven hundred kilobytes an arena, which is four or five mappings each, which is twenty thousand mappings over the process. A lookup then reads a control array, a slot array and an entry that have nothing to do with the ones the last lookup read and share no page with them, and the address translation misses as often as the data does. Measured on `server3`, one thread, five million eight byte entries: 3525 cycles a lookup at four thousand and ninety-six shards, 2477 at five hundred and twelve, and 2113 at sixty-four, with the instruction count identical to the digit at all three. Nothing about the work changed. Only where it landed.
+///
+/// So the count follows the threads rather than being a constant: sixteen shards a thread, which at one thread is the floor and at sixty-four threads is a thousand. Sixteen is enough that two threads picking the same shard at the same moment is rare, and the critical section is a probe and a copy rather than anything that waits.
+///
+/// What it costs is that a shard holds more, so the rehash that doubles it copies more while holding its lock. At sixteen threads and five million entries that is twenty thousand entries moved rather than twelve hundred, a few hundred microseconds on one shard out of two hundred and fifty-six, and it happens a handful of times over the life of a cache that keeps growing. `--shards` is still there for anyone who would rather have the old shape.
+pub const SHARDS_PER_THREAD: usize = 16;
+
+/// The fewest shards a map gets by default, whatever the thread count is.
+pub const MIN_SHARDS: usize = 64;
+
+/// How many shards a map gets when nobody says, for a server with `threads` threads.
+///
+/// Rounded up to a power of two, because the map rounds it up anyway and a number that is reported differently from the number in force is a number somebody will chase.
+#[must_use]
+pub fn shards_for(threads: usize) -> usize {
+    threads
+        .saturating_mul(SHARDS_PER_THREAD)
+        .clamp(MIN_SHARDS, rugo_map::MAX_SHARDS)
+        .next_power_of_two()
+}
 
 /// What the arguments asked for.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -54,13 +76,14 @@ pub struct Config {
 
 impl Default for Config {
     fn default() -> Self {
+        // The machines that produce published numbers have eight and thirty-two cores, and a thread per core is what every server in the comparison defaults to.
+        let threads = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
         Self {
-            // The machines that produce published numbers have eight and thirty-two cores, and a thread per core is what every server in the comparison defaults to.
-            threads: std::thread::available_parallelism().map_or(1, std::num::NonZero::get),
+            threads,
             port: Some(DEFAULT_PORT),
             unixsocket: None,
             maxmemory: 0,
-            shards: DEFAULT_SHARDS,
+            shards: shards_for(threads),
             uring: Uring::Auto,
         }
     }
@@ -89,7 +112,7 @@ Options:
   --no-port             do not listen on TCP at all
   --unixsocket <path>   also listen on a unix socket
   --threads <n>         serving threads (default: one per core)
-  --shards <n>          map shards, rounded up to a power of two (default 4096)
+  --shards <n>          map shards, rounded up to a power of two (default: 16 a thread)
   --maxmemory <size>    byte ceiling, as a number or with kb/mb/gb (default: none)
   --uring <auto|yes|no> use io_uring where the kernel has it (default auto)
   --version             print the version and exit
@@ -108,6 +131,8 @@ impl Config {
         S: AsRef<str>,
     {
         let mut config = Self::default();
+        // Held aside rather than written straight into the config, because the default depends on the thread count and the two flags may arrive in either order.
+        let mut shards = None;
         let mut args = args.into_iter();
         // Set by `--no-port` so that the order of `--port` and `--no-port` on one command line does not change the answer.
         let mut no_port = false;
@@ -125,7 +150,7 @@ impl Config {
                 "--no-port" => no_port = true,
                 "--port" | "-p" => config.port = Some(number(&value()?, arg)?),
                 "--threads" => config.threads = number::<usize>(&value()?, arg)?.max(1),
-                "--shards" => config.shards = number::<usize>(&value()?, arg)?.max(1),
+                "--shards" => shards = Some(number::<usize>(&value()?, arg)?.max(1)),
                 "--unixsocket" => config.unixsocket = Some(value()?),
                 "--maxmemory" => config.maxmemory = bytes(&value()?)?,
                 "--uring" => {
@@ -142,6 +167,7 @@ impl Config {
             }
         }
 
+        config.shards = shards.unwrap_or_else(|| shards_for(config.threads));
         if no_port {
             config.port = None;
         }
@@ -209,9 +235,24 @@ mod tests {
     fn no_arguments_is_a_server_on_the_usual_port() {
         let config = serve(&[]);
         assert_eq!(config.port, Some(DEFAULT_PORT));
-        assert_eq!(config.shards, DEFAULT_SHARDS);
+        assert_eq!(config.shards, shards_for(config.threads));
         assert_eq!(config.maxmemory, 0);
         assert!(config.threads >= 1);
+    }
+
+    #[test]
+    fn the_shard_count_follows_the_thread_count_whichever_order_the_flags_come_in() {
+        // Sixteen a thread, and the flags may arrive in either order, which is the whole reason the count is settled after the arguments are read rather than while they are.
+        assert_eq!(serve(&["--threads", "16"]).shards, 256);
+        assert_eq!(serve(&["--threads", "1"]).shards, MIN_SHARDS);
+        // Past the ceiling the map would round it down anyway, so the number reported is the number in force.
+        assert_eq!(serve(&["--threads", "4096"]).shards, rugo_map::MAX_SHARDS);
+    }
+
+    #[test]
+    fn a_shard_count_that_was_asked_for_wins_over_the_one_that_would_be_picked() {
+        assert_eq!(serve(&["--shards", "4096", "--threads", "2"]).shards, 4096);
+        assert_eq!(serve(&["--threads", "2", "--shards", "4096"]).shards, 4096);
     }
 
     #[test]

@@ -51,6 +51,12 @@ pub struct Table {
     len: usize,
     /// Slots holding [`DELETED`].
     tombstones: usize,
+    /// Entries carrying an expiry.
+    ///
+    /// Kept so that [`Table::sweep`] can tell, without reading anything, that there is nothing here to expire. The sweep walks slot numbers and asks each full one when it expires, and the only place that answer is written is the entry itself, so asking costs a read of the arena at a random offset. On a shard where nothing was given a TTL every one of those reads returns the same nothing, and there are a couple of hundred of them per call.
+    ///
+    /// Counting is exact rather than a hint, so a shard that does hold a timed entry is swept exactly as before. Every site that can change the answer already has the entry's header in hand for its own reasons, so the count is maintained without reading anything extra.
+    timed: usize,
     /// Inserts remaining before the table has to be rebuilt.
     growth_left: usize,
     /// The hash seed every key in this table was placed with.
@@ -69,6 +75,7 @@ impl Table {
             arena: Arena::new(),
             len: 0,
             tombstones: 0,
+            timed: 0,
             growth_left: 0,
             seed,
         }
@@ -160,6 +167,18 @@ impl Table {
             return None;
         }
         head.expiry(self.arena.get(at, head.size()))
+    }
+
+    /// Record that an entry which did or did not carry an expiry now does or does not.
+    ///
+    /// One place rather than five, because a count that is wrong in one direction makes the sweep skip a shard that has work in it, and an expired key that is never swept is a memory leak that nothing else in the map would notice.
+    #[inline]
+    fn retime(&mut self, was: bool, now: bool) {
+        if was && !now {
+            self.timed -= 1;
+        } else if !was && now {
+            self.timed += 1;
+        }
     }
 
     /// Find the slot holding `key`, if any.
@@ -282,6 +301,8 @@ impl Table {
             let old = Ref::from_bits(self.slots[at]);
             let old_size = head.size();
 
+            let was_timed = head.flags & entry::HAS_EXPIRY != 0;
+
             // Setting a key to a value of the length it already had is what a benchmark does over and over, and taking it in place skips a free and an allocation entirely.
             if old_size == size {
                 entry::write(
@@ -291,6 +312,7 @@ impl Table {
                     expiry,
                     user_flags,
                 );
+                self.retime(was_timed, expiry.is_some());
                 return Ok(Wrote::Replaced);
             }
 
@@ -305,6 +327,7 @@ impl Table {
             );
             self.arena.free(old, old_size);
             self.slots[at] = new.bits();
+            self.retime(was_timed, expiry.is_some());
             return Ok(Wrote::Replaced);
         }
 
@@ -331,6 +354,7 @@ impl Table {
         self.ctrl[at] = tag_of(hash);
         self.slots[at] = new.bits();
         self.len += 1;
+        self.retime(false, expiry.is_some());
         Ok(Wrote::Inserted)
     }
 
@@ -366,7 +390,10 @@ impl Table {
             return Ok(false);
         }
 
-        match (head.flags & entry::HAS_EXPIRY != 0, expiry) {
+        // Read before the rewrite branch below shadows `head` with the copy it decodes out of the entry it is moving.
+        let was_timed = head.flags & entry::HAS_EXPIRY != 0;
+
+        match (was_timed, expiry) {
             // The field is already there and is the same width either way, so this is four bytes written over four bytes and nothing else moves.
             (true, Some(when)) => {
                 let size = head.size();
@@ -399,6 +426,7 @@ impl Table {
                 );
                 self.arena.free(entry, old);
                 self.slots[at] = new.bits();
+                self.retime(was_timed, expiry.is_some());
             }
         }
         Ok(true)
@@ -409,7 +437,10 @@ impl Table {
     /// A slot becomes [`EMPTY`] only when its group already holds an empty lane, because in that case no probe sequence ever ran past this slot and none will now. Otherwise it becomes a tombstone, which later probes have to walk over. Getting this backwards does not make the table slow, it makes unrelated keys unreachable, which is why it is the one place here that tests a condition rather than storing unconditionally.
     fn erase(&mut self, at: usize) {
         let entry = Ref::from_bits(self.slots[at]);
-        let size = self.head_at(entry).size();
+        // The header is decoded here anyway, to learn how much arena to give back, so the expiry flag comes along for nothing.
+        let head = self.head_at(entry);
+        let size = head.size();
+        let was_timed = head.flags & entry::HAS_EXPIRY != 0;
         let base = at - (at % WIDTH);
 
         if self.group_at(base).match_empty().any() {
@@ -422,6 +453,7 @@ impl Table {
         self.slots[at] = Ref::NONE.bits();
         self.arena.free(entry, size);
         self.len -= 1;
+        self.retime(was_timed, false);
     }
 
     /// Make room for at least one more insert.
@@ -508,6 +540,7 @@ impl Table {
         }
         self.len = 0;
         self.tombstones = 0;
+        self.timed = 0;
         self.growth_left = self.slots.len() * LOAD_NUM / LOAD_DEN;
     }
 
@@ -515,6 +548,12 @@ impl Table {
     ///
     /// Returns where to resume and how many went. Bounded rather than exhaustive so a caller can sweep a large shard in pieces without holding its lock for the whole of it, which is the difference between a background sweep and a stall.
     pub fn sweep(&mut self, from: usize, budget: usize, now: u32) -> (usize, usize) {
+        // Nothing in this shard was given a TTL, so there is nothing here that can have expired. The walk below would read the header of every full slot it passed to be told so one entry at a time, and those headers are at unrelated offsets in the arena, so the reading is what the call costs rather than the walking. Measured on `server3`, one thread, pipeline depth twenty-five over a unix socket against a map of ten million keys none of which had an expiry, the whole call was worth about two hundred and fifty cycles per operation out of five thousand eight hundred.
+        //
+        // The position is returned unmoved. There was nothing to find here, so resuming where this left off loses nothing, and advancing it would mean a shard that later gains a TTL starts its first real sweep partway through.
+        if self.timed == 0 {
+            return (from, 0);
+        }
         if self.slots.is_empty() {
             return (0, 0);
         }
@@ -629,6 +668,116 @@ mod tests {
 
     fn get(table: &mut Table, key: &[u8]) -> Option<Vec<u8>> {
         table.get(key, h(key), 0).map(<[u8]>::to_vec)
+    }
+
+    /// How many entries actually carry an expiry, counted by looking at every one of them.
+    ///
+    /// The slow answer to the question `timed` keeps the fast answer to. A test that compared the field against itself would pass no matter which sites forgot to maintain it.
+    fn count_timed(table: &Table) -> usize {
+        (0..table.slots.len())
+            .filter(|&at| is_full(table.ctrl[at]))
+            .filter(|&at| {
+                let entry = Ref::from_bits(table.slots[at]);
+                table.head_at(entry).flags & entry::HAS_EXPIRY != 0
+            })
+            .count()
+    }
+
+    #[test]
+    fn the_count_of_timed_entries_survives_every_way_one_can_change() {
+        // What the sweep now trusts instead of reading. If it is ever too low the sweep skips a shard that has expired keys in it, and those keys are then held until something happens to look one of them up, which for a key nobody asks for again is never. So this walks every route by which an entry can gain or lose an expiry and checks the count against the entries themselves rather than against itself.
+        let mut table = Table::new(SEED);
+
+        // Inserted with and without.
+        for i in 0..500u32 {
+            let key = format!("key:{i}");
+            let expiry = if i % 3 == 0 { Some(1_000) } else { None };
+            table
+                .set(key.as_bytes(), b"v", h(key.as_bytes()), expiry, None)
+                .unwrap();
+        }
+        assert_eq!(table.timed, count_timed(&table), "after inserting");
+
+        // Replaced at the same width, which is the path that writes over the entry in place.
+        for i in 0..200u32 {
+            let key = format!("key:{i}");
+            let expiry = if i % 2 == 0 { Some(2_000) } else { None };
+            table
+                .set(key.as_bytes(), b"w", h(key.as_bytes()), expiry, None)
+                .unwrap();
+        }
+        assert_eq!(table.timed, count_timed(&table), "after replacing in place");
+
+        // Replaced at a different width, which is the path that moves the entry.
+        for i in 0..200u32 {
+            let key = format!("key:{i}");
+            let expiry = if i % 4 == 0 { Some(3_000) } else { None };
+            let value = "x".repeat(i as usize % 40 + 1);
+            table
+                .set(
+                    key.as_bytes(),
+                    value.as_bytes(),
+                    h(key.as_bytes()),
+                    expiry,
+                    None,
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            table.timed,
+            count_timed(&table),
+            "after replacing at a new width"
+        );
+
+        // EXPIRE and PERSIST, which is the only path that changes the trailer without changing the value.
+        for i in 0..300u32 {
+            let key = format!("key:{i}");
+            let expiry = if i % 5 == 0 { Some(4_000) } else { None };
+            table
+                .expire(key.as_bytes(), h(key.as_bytes()), expiry, 0)
+                .unwrap();
+        }
+        assert_eq!(table.timed, count_timed(&table), "after expire and persist");
+
+        // Removed.
+        for i in (0..500u32).step_by(3) {
+            let key = format!("key:{i}");
+            table.remove(key.as_bytes(), h(key.as_bytes()));
+        }
+        assert_eq!(table.timed, count_timed(&table), "after removing");
+
+        // Rebuilt, which moves every entry to a new slot.
+        table.shrink();
+        assert_eq!(table.timed, count_timed(&table), "after a rebuild");
+
+        table.clear();
+        assert_eq!(table.timed, 0, "a cleared table holds no expiry");
+        assert_eq!(table.timed, count_timed(&table), "after clearing");
+    }
+
+    #[test]
+    fn a_shard_with_an_expiry_in_it_is_still_swept() {
+        // The other half of the skip. Nothing above would fail if `timed` were wired to zero and the sweep never ran again, so this is the test that says the shortcut is a shortcut and not a removal.
+        let mut table = Table::new(SEED);
+        for i in 0..100u32 {
+            let key = format!("key:{i}");
+            table
+                .set(key.as_bytes(), b"v", h(key.as_bytes()), Some(10), None)
+                .unwrap();
+        }
+        assert_eq!(table.timed, 100);
+
+        // Every key expired at ten and the clock reads eleven.
+        let (_, removed) = table.sweep(0, table.capacity(), 11);
+        assert_eq!(
+            removed, 100,
+            "the sweep found nothing to remove in a table of expired keys"
+        );
+        assert_eq!(table.len(), 0);
+        assert_eq!(
+            table.timed, 0,
+            "removing the last timed entry left the count behind"
+        );
     }
 
     #[test]

@@ -53,7 +53,7 @@ enum Where {
 
 /// What to send and how much of it.
 #[derive(Debug, Clone)]
-struct Load {
+pub(crate) struct Load {
     /// Where the server is.
     at: Where,
     /// Connections, and therefore client threads.
@@ -69,7 +69,7 @@ struct Load {
     /// Sets per set plus gets, as a fraction of a thousand, so a ratio of one to ten is ninety.
     sets_per_mille: u64,
     /// The server's process id, when it was given.
-    pid: Option<u32>,
+    pub(crate) pid: Option<u32>,
     /// What the key sequence is drawn from.
     seed: u64,
 }
@@ -90,6 +90,19 @@ impl Default for Load {
     }
 }
 
+/// What one timed run cost.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Run {
+    /// Operations completed.
+    pub(crate) ops: usize,
+    /// How long they took.
+    pub(crate) seconds: f64,
+    /// The server's processor time an operation, in microseconds, where `/proc` could say and a process id was given.
+    pub(crate) server: Option<f64>,
+    /// The generator's own, on the same terms. A run where this moves with the server's is a run that measured the box.
+    pub(crate) client: Option<f64>,
+}
+
 /// What one connection did.
 #[derive(Debug, Default)]
 struct Did {
@@ -106,32 +119,44 @@ pub(crate) fn run(args: &[String]) -> Result<(), String> {
         return Ok(());
     }
     let load = parse(args)?;
-    fill(&load)?;
+    let run = once(&load)?;
 
-    // After the fill rather than before it, so that what the fill spent is not charged to the operations that were timed.
+    println!("{} operations in {:.3} s", run.ops, run.seconds);
+    println!("{:.0} operations a second", rate(run.ops, run.seconds));
+    report("server", run.server);
+    report("client", run.client);
+    Ok(())
+}
+
+/// Fill the keyspace and then run the load once, timed.
+///
+/// The fill is not timed and the processor clocks are read after it rather than before, so that what writing every key cost is not charged to the operations that were measured.
+pub(crate) fn once(load: &Load) -> Result<Run, String> {
+    fill(load)?;
+
     let before = cpu_of(load.pid);
     let client_before = cpu_of(Some(std::process::id()));
     let clock = Instant::now();
-    let did = drive(&load)?;
-    let elapsed = clock.elapsed().as_secs_f64();
-
+    let did = drive(load)?;
+    let seconds = clock.elapsed().as_secs_f64();
     let after = cpu_of(load.pid);
     let client_after = cpu_of(Some(std::process::id()));
-
-    let ops: usize = did.iter().map(|one| one.ops).sum();
-    println!("{ops} operations in {elapsed:.3} s");
-    println!("{:.0} operations a second", rate(ops, elapsed));
-    report("server", before, after, ops);
-    report("client", client_before, client_after, ops);
 
     if let Some(error) = did.iter().find_map(|one| one.error.clone()) {
         return Err(format!("the server answered with an error: {error}"));
     }
-    Ok(())
+
+    let ops: usize = did.iter().map(|one| one.ops).sum();
+    Ok(Run {
+        ops,
+        seconds,
+        server: each(before, after, ops),
+        client: each(client_before, client_after, ops),
+    })
 }
 
 /// Read the flags, leaving everything not named at its default.
-fn parse(args: &[String]) -> Result<Load, String> {
+pub(crate) fn parse(args: &[String]) -> Result<Load, String> {
     let mut load = Load::default();
     let mut socket: Option<PathBuf> = None;
     let mut port: Option<u16> = None;
@@ -447,21 +472,26 @@ fn rate(ops: usize, seconds: f64) -> f64 {
     ops as f64 / seconds
 }
 
-/// Print what one side spent, when it could be measured.
+/// Processor microseconds an operation, out of two readings of the same clock.
 #[expect(
     clippy::cast_precision_loss,
     reason = "the same operation count as above, divided rather than multiplied"
 )]
-fn report(who: &str, before: Option<f64>, after: Option<f64>, ops: usize) {
+fn each(before: Option<f64>, after: Option<f64>, ops: usize) -> Option<f64> {
     let (Some(before), Some(after)) = (before, after) else {
-        return;
+        return None;
     };
-    let spent = after - before;
     if ops == 0 {
-        return;
+        return None;
     }
-    let each = spent * 1e6 / ops as f64;
-    println!("{who} processor time {spent:.3} s, {each:.3} microseconds an operation");
+    Some((after - before) * 1e6 / ops as f64)
+}
+
+/// Print what one side spent, when it could be measured.
+fn report(who: &str, each: Option<f64>) {
+    if let Some(each) = each {
+        println!("{who} processor time {each:.3} microseconds an operation");
+    }
 }
 
 #[cfg(test)]

@@ -32,6 +32,8 @@ The short version: this is a cache, not a database. Everything about durability,
 
 **R10, eviction is decided per shard rather than against a total.** `--maxmemory` is divided by the shard count and enforced against the lock each write already holds. A single shared counter read and written a million times a second is one cache line moving between every core in the machine, which costs more than the eviction it decides about. The price is that an unusually full shard evicts sooner than the whole cache being over would justify; with thousands of shards and a hash that spreads, the fullest shard runs within a small factor of the mean.
 
+**R11, a value larger than one shard's share of `maxmemory` is stored and takes the cache over its ceiling.** Eviction never takes the entry the write it is serving has just made, so a value with nowhere to fit is kept rather than written, answered for and then thrown away by its own write. The shard stays over its share until the next write to it, which spares a different key and may take this one. Redis stores such a value too and evicts other keys to make room for it, so the answer a client sees is the same; what differs is that the ceiling rugo goes over is a shard's share rather than the whole of `maxmemory`. With `--maxmemory 8gb` on eight threads, a share is sixty-four megabytes.
+
 ## From pogocache
 
 `rugo` takes its architecture from [tidwall/pogocache](https://github.com/tidwall/pogocache) and none of its code. The shape — thousands of shards, a lock per shard, a poller per thread, an open-addressed table with the entries packed rather than allocated — is the same. What follows is where it deliberately is not, and each of these is a bet that a sweep will eventually settle.

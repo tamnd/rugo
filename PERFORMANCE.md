@@ -24,6 +24,33 @@ Two of the four binaries in the second attempt were the pacing change in the cha
 
 The lesson is about the harness rather than about either loop. Processor time an operation is the right metric and it is not enough on its own: a run only says something if the generator's share of it stays flat while the server's moves. Both attempts are worth about half an hour on `server3` once its sweep is done, and nothing at all before then.
 
+## What a shard count costs in memory, which is less than it looks
+
+Not a change. This is the price list a throughput change would be spent against, measured before anybody spends it, and it came out somewhere other than where it was expected to.
+
+A server picks sixteen shards a thread, so eight threads gets a hundred and twenty-eight. Raising that is one of the few levers left on the lock side, and the reason nobody had pulled it is that more shards was assumed to cost memory: each shard owns a table and an arena, and four thousand of them sounded like four thousand indexes and four thousand part-used segments. Half of that turns out to be wrong.
+
+The index does not move at all. `Map::with_seed` rounds the shard count up to a power of two, and a shard's table capacity is a power of two chosen from the entries that land in it, so doubling the shard count halves what a shard holds and halves the capacity it grows to, and the two cancel exactly. At ten million entries the whole index is 83,886,080 bytes at a hundred and twenty-eight shards, and at two hundred and fifty-six, and at five hundred and twelve, and at one thousand and twenty-four, at two thousand and forty-eight and at four thousand and ninety-six. To the byte, every time: two to the twenty-fourth slots at five bytes each. That is arithmetic rather than a measurement and it holds on any machine, which is why no machine is named for it.
+
+What does move is arena slack, and that is the whole of the price. Measured on `server1`, which is four cores with other tenants on it, a server started with `--threads 8 --shards N --no-port` over a unix socket and filled by `cargo xtask load` with ten million keys of eight bytes, reading `used_memory` out of `INFO` and `VmHWM` out of `/proc/<pid>/status` and dividing the difference by the entries. A memory high water mark is far less sensitive to a noisy box than a cycle count is, which is why this one was worth taking there and the throughput half was not.
+
+| shards | bytes an entry beyond what the map accounts for |
+| --- | --- |
+| 128 | 0.56, 0.57, 0.61 |
+| 256 | 0.79, 0.83, 0.84, 0.94 |
+| 512 | 1.74, 1.90, 1.97, 2.03, 2.03 |
+| 1024 | 1.90, 1.92, 1.97 |
+| 2048 | 2.19, 2.23, 2.29 |
+| 4096 | 2.78, 2.82, 2.86 |
+
+Two of the runs in the two hundred and fifty-six row were asked for a hundred and ninety-two, and two of the runs in the five hundred and twelve row were asked for three hundred and eighty-four. They are in those rows because that is what they got: the count is rounded up to a power of two, so a hundred and ninety-two is two hundred and fifty-six and the reading says so. It is worth knowing that `--shards 192` is not a setting.
+
+So going from the hundred and twenty-eight an eight thread server picks by default to four thousand and ninety-six costs about two and a quarter bytes an entry. Against an overhead of around twenty that is real and it is not a wall, and the memory gate would survive it.
+
+The wall is on the other side, and it was already measured. `SHARDS_PER_THREAD` in `rugo-server`'s `config.rs` carries a reading from `server3`, one thread, five million eight byte entries: 3525 cycles a lookup at four thousand and ninety-six shards, 2477 at five hundred and twelve and 2113 at sixty-four, with the instruction count identical to the digit at all three. Nothing about the work changed, only where it landed. That is why the default follows the thread count instead of being four thousand, and it means the lever points the other way from where it was reached for.
+
+What is still open is whether that one thread result holds at eight, where the locks are actually being shared and a coarse count has something to lose. `cargo xtask ab` at a hundred and twenty-eight against one thousand and twenty-four and four thousand and ninety-six, at eight threads, on `server3` once its sweep is done, is the run that answers it. The memory column above is already filled in, so whatever that run says, the trade is a known one in both directions.
+
 ## A batch of parsed commands rather than a batch of asked-for keys
 
 Never opened. The idea it was competing with landed instead, and this is the version of it that did not work.

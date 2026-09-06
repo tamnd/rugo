@@ -20,6 +20,11 @@ const CHUNK: usize = 16 * 1024;
 /// How much unparsed room has to be free before a read, or the buffer is compacted first.
 const SPARE: usize = 4 * 1024;
 
+/// How many commands ahead the connection asks the map for cache lines.
+///
+/// This is how many misses the machine is asked to carry at once, so the right number is a property of the machine rather than of the map. A probe with no server around it swept four to thirty two on `epyc8` and every reading landed between 1444 and 1766 cycles a lookup with no ordering to it, so four is already enough there and more is not worse. Eight is in the middle of that flat stretch and is also the depth at which a pipeline of twenty five, which is what the sweep sends, divides into whole batches with a remainder that is still worth asking for.
+const AHEAD: usize = 8;
+
 /// The largest a single request may grow the read buffer.
 ///
 /// A client may announce a bulk string of half a gigabyte, and the parser will hold what has arrived until the rest does. Without a bound, a handful of connections that announce a large value and then go quiet is the whole machine's memory. Sixteen mebibytes is far above any cache value anybody stores and far below anything that matters.
@@ -247,6 +252,47 @@ impl Conn {
         Ok(())
     }
 
+    /// Ask the map for the lines the next few commands in the buffer will read, and report how far ahead the asking got.
+    ///
+    /// A lookup is three loads that depend on each other, so past the last level of cache it is three misses that cannot overlap and that is most of what a get costs. They can overlap across commands though, and a pipelined client has already sent the next few, so the addresses are sitting in the read buffer waiting to be read off it.
+    ///
+    /// Two passes rather than one because the second address is inside the line the first pass asks for. Asking for an entry before its index has arrived would be asking at whatever the stale slot used to say, which is a wasted line rather than a wrong answer, but it is still wasted.
+    ///
+    /// Nothing here reads anything and nothing here can be wrong. A hint at a line that turns out not to be wanted costs one line of cache, and a hint at an address that has been rebuilt away is dropped by the hardware rather than faulting.
+    ///
+    /// The peek is deliberately not a parse. An earlier version of this held [`AHEAD`] parsed commands so the execute pass could reuse them, and on `epyc8` it cost a fifth more cycles a get than not looking ahead at all, with the extra misses landing in the argument lists rather than in the map. Reading the framing twice and keeping one argument list is cheaper than reading it once and keeping eight.
+    fn ask_ahead(env: &Env<'_>, buf: &[u8], from: usize, filled: usize) -> usize {
+        let mut keys = [(0_usize, 0_usize); AHEAD];
+        let mut found = 0;
+        let mut scan = from;
+        for _ in 0..AHEAD {
+            let Some((used, key)) = rugo_resp::peek(&buf[scan..filled]) else {
+                break;
+            };
+            if let Some((at, len)) = key {
+                keys[found] = (scan + at, len);
+                found += 1;
+            }
+            scan += used;
+        }
+
+        // One key is the command about to run, and asking for a line a few instructions before reading it buys nothing. The overlap is the whole point, so there has to be something to overlap.
+        if found > 1 {
+            for &(at, len) in &keys[..found] {
+                if let Some(key) = buf.get(at..at + len) {
+                    env.map.warm(key);
+                }
+            }
+            for &(at, len) in &keys[..found] {
+                if let Some(key) = buf.get(at..at + len) {
+                    env.map.warm_entry(key);
+                }
+            }
+        }
+
+        scan
+    }
+
     /// Run every whole command in the read buffer.
     fn execute(&mut self, env: &Env<'_>) {
         // Split so the read buffer, the argument list and the reply buffer are three borrows rather than one, which is what lets a command read its arguments out of one and write its answer into another.
@@ -261,7 +307,13 @@ impl Conn {
             ..
         } = self;
 
+        // How far into the buffer the map has been asked for lines. Commands are executed one at a time as they always were, and the asking runs ahead of them in steps of [`AHEAD`] commands.
+        let mut asked = *at;
+
         while !*closing && out.len() < MAX_REPLY {
+            if *at >= asked {
+                asked = Self::ask_ahead(env, buf, *at, *filled);
+            }
             let rest = &buf[*at..*filled];
             match rugo_resp::parse(rest, command) {
                 Ok(Parsed::Done(used)) => {

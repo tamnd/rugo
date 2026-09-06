@@ -232,6 +232,45 @@ fn parse_inline(buf: &[u8], into: &mut Command) -> Result<Parsed, Bad> {
     Ok(Parsed::Done(at))
 }
 
+/// Where the command at the front of `buf` ends, and where its key is, without building an argument list.
+///
+/// A connection that wants to ask the map for a key's cache lines before it reads them has to know the key, and the key is the only part of the parse it needs. This walks the same framing [`parse`] walks and records one span out of it, so a connection can look several commands ahead while keeping exactly one [`Command`] alive.
+///
+/// That last part is the whole reason this exists rather than a loop over [`parse`] into an array of commands. Holding a parsed command per look-ahead step was measured on `epyc8` and was slower than not looking ahead at all, by a fifth with the hints in and by four fifths with them taken out again, and the extra misses were in the argument lists and not in the map.
+///
+/// The key is the second argument, which is where it is for every command here that has one. A command with fewer arguments than that reports its length and no span, which is what `PING` does.
+///
+/// Returns `None` for anything it cannot read whole, which is a command that has not all arrived, framing that is wrong, and the inline form. All three are the real parse's business, and a look-ahead that tried to answer them would be deciding on the hot path what it is not the one to decide.
+#[must_use]
+pub fn peek(buf: &[u8]) -> Option<(usize, Option<(usize, usize)>)> {
+    if *buf.first()? != b'*' {
+        return None;
+    }
+    let (header, mut at) = line(buf, 0)?;
+    let count = usize::try_from(number(&header[1..]).ok()?).ok()?;
+    if count > MAX_ARGS {
+        return None;
+    }
+
+    let mut key = None;
+    for n in 0..count {
+        let (header, next) = line(buf, at)?;
+        let Some((&b'$', digits)) = header.split_first() else {
+            return None;
+        };
+        let len = usize::try_from(number(digits).ok()?).ok()?;
+        if len > MAX_BULK || buf.len() < next + len + 2 {
+            return None;
+        }
+        if n == 1 {
+            key = Some((next, len));
+        }
+        at = next + len + 2;
+    }
+
+    Some((at, key))
+}
+
 /// The line starting at `at`, and where the line after it starts.
 ///
 /// A line ends at the first `\n`, and a `\r` before it belongs to the terminator rather than to the line. Redis is lenient about the `\r` and so is this, because the inline form is typed by hand often enough to matter.
@@ -586,6 +625,50 @@ mod tests {
         let mut command = Command::new();
         let buf = vec![b'x'; MAX_INLINE + 1];
         assert_eq!(parse(&buf, &mut command), Err(Bad::NoNewline));
+    }
+
+    #[test]
+    fn a_look_ahead_agrees_with_the_parse_that_follows_it() {
+        // The only thing peek has to get right is where the command ends and where its key is, because the connection uses the first to find the next command and the second to ask the map for cache lines. Both answers are checked against the parse rather than against a number written here, since the parse is the one that decides.
+        let cases: [&[u8]; 4] = [
+            b"*2\r\n$3\r\nGET\r\n$5\r\nalpha\r\n",
+            b"*3\r\n$3\r\nSET\r\n$3\r\nkey\r\n$5\r\nvalue\r\n",
+            b"*1\r\n$4\r\nPING\r\n",
+            b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$6\r\na\r\nb\r\n\r\n",
+        ];
+        let mut command = Command::new();
+        for buf in cases {
+            let (used, key) = peek(buf).expect("a whole command");
+            assert_eq!(parse(buf, &mut command), Ok(Parsed::Done(used)));
+            assert_eq!(key.map(|(at, len)| &buf[at..at + len]), command.arg(1, buf));
+        }
+    }
+
+    #[test]
+    fn a_look_ahead_over_a_pipeline_walks_it_command_by_command() {
+        let buf = b"*2\r\n$3\r\nGET\r\n$1\r\na\r\n*2\r\n$3\r\nGET\r\n$1\r\nb\r\n*2\r\n$3\r\nGET\r\n$1\r\nc\r\n";
+        let mut at = 0;
+        let mut found = Vec::new();
+        while let Some((used, key)) = peek(&buf[at..]) {
+            found.push(key.map(|(from, len)| &buf[at + from..at + from + len]));
+            at += used;
+        }
+        assert_eq!(at, buf.len());
+        assert_eq!(
+            found,
+            vec![Some(&b"a"[..]), Some(&b"b"[..]), Some(&b"c"[..])]
+        );
+    }
+
+    #[test]
+    fn a_look_ahead_declines_what_it_cannot_read_whole() {
+        // Every one of these is something the real parse has an answer for, and none of them is something a look-ahead should be answering. Half a command is a read away from being whole, bad framing closes the connection, and the inline form has no key in it.
+        assert_eq!(peek(b"*2\r\n$3\r\nGET\r\n$5\r\nalp"), None);
+        assert_eq!(peek(b"*2\r\n$3\r\nGET\r\n"), None);
+        assert_eq!(peek(b"*x\r\n"), None);
+        assert_eq!(peek(b"*1\r\n:1\r\n"), None);
+        assert_eq!(peek(b"PING\r\n"), None);
+        assert_eq!(peek(b""), None);
     }
 
     #[test]

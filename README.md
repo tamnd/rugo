@@ -44,7 +44,7 @@ Options:
   --help                print this and exit
 ```
 
-`--uring` is accepted and does nothing yet.
+`--uring` picks the serving loop on Linux. `auto` takes an io_uring loop where the kernel offers one and falls back to epoll where it does not, `yes` refuses to start where it cannot have one, and `no` keeps the poller. Everywhere else there is only the poller and `yes` is an error. The two loops answer the same bytes, which the wire tests check by running the same script through both, and which of them is faster here has not been measured yet.
 
 ## The commands
 

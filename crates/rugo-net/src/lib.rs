@@ -10,10 +10,13 @@
 //!
 //! Both backends are used in their default level-triggered mode. Edge triggering saves a syscall on a connection that has more to read than one buffer holds, and costs correctness on every path that forgets to drain: a connection whose reader stops one byte early under edge triggering hangs until the client sends something else. A cache server's reads are one buffer nearly always, so the saving is nearly never and the hazard is always.
 //!
-//! `io_uring` is the interesting backend and it is not here yet. It replaces this interface rather than sitting under it, because a completion model does not pretend to be a readiness one without giving back what makes it worth having.
+//! `io_uring` is in [`uring`], on Linux, and it is beside this interface rather than under it. A completion model does not pretend to be a readiness one without giving back what makes it worth having, so the server has a loop for each and picks one at startup.
 
 use std::io;
 use std::os::fd::RawFd;
+
+#[cfg(target_os = "linux")]
+pub mod uring;
 
 /// What a socket is being watched for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

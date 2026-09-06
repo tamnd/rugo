@@ -47,16 +47,33 @@ pub(crate) enum Stream {
 }
 
 impl Stream {
-    /// Put the socket in the only mode this server can use.
+    /// Put the socket in the only mode the readiness loop can use.
     ///
     /// Nagle off as well as non-blocking, because a reply held back waiting for a second one to coalesce with is a reply that arrives a millisecond late, and a latency percentile that reads as this server's fault.
     pub(crate) fn prepare(&self) -> io::Result<()> {
+        self.no_delay()?;
         match self {
-            Self::Tcp(stream) => {
-                stream.set_nonblocking(true)?;
-                stream.set_nodelay(true)
-            }
+            Self::Tcp(stream) => stream.set_nonblocking(true),
             Self::Unix(stream) => stream.set_nonblocking(true),
+        }
+    }
+
+    /// Put the socket in the mode the completion loop wants, which is the ordinary blocking one.
+    ///
+    /// Non-blocking is what a readiness loop needs and is the wrong thing to ask a ring for. There the waiting is the ring's job: a recv is submitted, the kernel parks it until bytes arrive, and a completion says how many there were. A socket marked non-blocking invites the kernel to hand back `EAGAIN` instead of parking the operation, which turns a submitted read into a completion saying nothing happened and the loop into a spin.
+    ///
+    /// Nagle is off for the reason above, which does not depend on which loop is running.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn prepare_uring(&self) -> io::Result<()> {
+        self.no_delay()
+    }
+
+    /// Turn Nagle off, where there is a Nagle to turn off.
+    fn no_delay(&self) -> io::Result<()> {
+        match self {
+            Self::Tcp(stream) => stream.set_nodelay(true),
+            // A unix socket has no Nagle, because it has no network to be thrifty with.
+            Self::Unix(_) => Ok(()),
         }
     }
 }
@@ -103,6 +120,32 @@ pub(crate) enum Turn {
     /// Keep it, wanting to be told when it is writable as well, because a reply did not fit.
     Write,
     /// Drop it.
+    Close,
+}
+
+/// What a connection wants done for it next, when a ring is doing it.
+///
+/// The completion loop's answer to [`Turn`]. A readiness loop asks what to watch the socket for and does the reading itself; a ring is told what to read and where to put it, so the connection hands over an address rather than an interest.
+///
+/// One of these is outstanding at a time for a connection, which is what makes the addresses safe to hand to the kernel: nothing touches either buffer between the submission and its completion, so neither can be grown or moved out from under it.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Step {
+    /// Read up to `len` bytes into `at`.
+    Recv {
+        /// Where the bytes go, which is the free part of the read buffer.
+        at: *mut u8,
+        /// How much room there is.
+        len: usize,
+    },
+    /// Write `len` bytes from `at`.
+    Send {
+        /// Where the bytes are, which is the unwritten part of the reply buffer.
+        at: *const u8,
+        /// How many there are.
+        len: usize,
+    },
+    /// Nothing more is owed and nothing more is wanted.
     Close,
 }
 
@@ -367,6 +410,73 @@ impl Conn {
             self.sent = 0;
         }
         Ok(())
+    }
+}
+
+/// The half of a connection the completion loop uses, which is Linux only because rings are.
+///
+/// Nothing above knows these exist and nothing here duplicates them. The reading and the writing are the ring's, so what is left for a connection to do is say where the bytes should go, take the count that came back, and answer whatever that made whole, which is the same [`Conn::execute`] the other loop calls.
+#[cfg(target_os = "linux")]
+impl Conn {
+    /// Whether there is a reply the socket has not taken yet.
+    ///
+    /// What the completion loop reads a finished operation as: a connection that owes bytes had a send in flight, and one that owes none had a read.
+    pub(crate) fn owes(&self) -> bool {
+        self.sent < self.out.len()
+    }
+
+    /// Record that `bytes` arrived where the last [`Step::Recv`] said to put them.
+    ///
+    /// Clamped rather than trusted. The count comes back through a completion queue and is bounded by the length that was submitted, and a wrong one here would be an index past the end of the buffer, so it is cheaper not to depend on it being right than to prove that it is.
+    pub(crate) fn arrived(&mut self, bytes: usize) {
+        self.filled = self.buf.len().min(self.filled + bytes);
+    }
+
+    /// Record that `bytes` of the reply went out.
+    pub(crate) fn written(&mut self, bytes: usize) {
+        self.sent = self.out.len().min(self.sent + bytes);
+    }
+
+    /// Answer whatever has arrived and say what the ring should do next.
+    ///
+    /// The completion loop's whole state machine. Writing comes before reading, because a reply that is owed is a client that is waiting, and because the read buffer cannot be compacted while a reply is still being written out of the other one.
+    ///
+    /// It loops rather than returning after one execute for the sake of the reply ceiling: a deep pipeline of `MGET`s fills the reply buffer, [`Conn::execute`] stops early, and what is left in the read buffer is answered on the next pass once the socket has taken what is here. Every pass either has something to write or ends the loop, so while the ceiling holds it runs at most twice.
+    pub(crate) fn step(&mut self, env: &Env<'_>) -> Step {
+        loop {
+            if self.owes() {
+                return Step::Send {
+                    at: self.out[self.sent..].as_ptr(),
+                    len: self.out.len() - self.sent,
+                };
+            }
+            self.out.clear();
+            self.sent = 0;
+
+            if self.closing {
+                return Step::Close;
+            }
+
+            if self.at < self.filled {
+                self.execute(env);
+                if !self.out.is_empty() {
+                    continue;
+                }
+                if self.closing {
+                    return Step::Close;
+                }
+            }
+
+            // Half a command in the buffer, or none at all. Either way what happens next is more bytes.
+            return match self.make_room() {
+                Ok(()) => Step::Recv {
+                    at: self.buf[self.filled..].as_mut_ptr(),
+                    len: self.buf.len() - self.filled,
+                },
+                // A request larger than this will buffer, which is the only thing that fails here, and there is no answering it because there is no telling where the next command would begin.
+                Err(_) => Step::Close,
+            };
+        }
     }
 }
 

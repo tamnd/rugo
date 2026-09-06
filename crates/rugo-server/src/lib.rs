@@ -13,11 +13,15 @@
 //! # The loop
 //!
 //! Level-triggered, one read a readiness event, no timers except a poll timeout that gives the clock a tick and the map a sweep. Everything a connection does is in `conn`, and everything a command does is in `dispatch`.
+//!
+//! On Linux there is a second loop, in `uring`, which answers the same commands out of the same connections and differs only in how bytes get in and out. Which one runs is decided once for the whole process, by `--uring`, so a thread cannot be serving on a ring while its neighbour serves on a poller.
 
 pub mod config;
 mod conn;
 mod dispatch;
 mod stats;
+#[cfg(target_os = "linux")]
+mod uring;
 
 use std::io;
 use std::net::{Ipv4Addr, TcpListener};
@@ -157,8 +161,11 @@ impl Server {
     ///
     /// # Errors
     ///
-    /// Whatever the calling thread's loop failed with, which is a poller that could not be created or a syscall that failed in a way this cannot continue past.
+    /// Whatever the calling thread's loop failed with, which is a poller or a ring that could not be created or a syscall that failed in a way this cannot continue past, and `--uring yes` on a machine that has no `io_uring` to give.
     pub fn run(&self) -> io::Result<()> {
+        // Asked once rather than a thread. Every thread would get the same answer, `--uring yes` on a kernel without one should be one refusal at startup rather than as many as there are cores, and a process half of whose threads are on a ring is a process whose numbers mean nothing.
+        let uring = self.uring()?;
+
         std::thread::scope(|scope| {
             for thread in 1..self.config.threads {
                 let worker = Worker {
@@ -172,7 +179,7 @@ impl Server {
                 std::thread::Builder::new()
                     .name(format!("rugo-{thread}"))
                     .spawn_scoped(scope, move || {
-                        if let Err(error) = worker.serve() {
+                        if let Err(error) = worker.serve(uring) {
                             // One thread failing is not the others failing, and a server that went on serving on the rest without saying so would be a server quietly running at a fraction of its threads.
                             eprintln!("rugo: thread {thread} stopped: {error}");
                         }
@@ -187,8 +194,40 @@ impl Server {
                 config: &self.config,
                 started: self.started,
             }
-            .serve()
+            .serve(uring)
         })
+    }
+
+    /// Whether this run serves on a ring.
+    ///
+    /// `auto` asks the kernel by building a ring and throwing it away, which is the only honest way to ask: a version number says what was compiled, and what matters is whether the syscall is allowed, which a container's seccomp profile has the last word on.
+    #[cfg(target_os = "linux")]
+    fn uring(&self) -> io::Result<bool> {
+        match self.config.uring {
+            Uring::No => Ok(false),
+            Uring::Auto => Ok(rugo_net::uring::Ring::available()),
+            Uring::Yes => match rugo_net::uring::Ring::new(8) {
+                Ok(_) => Ok(true),
+                Err(error) => Err(io::Error::new(
+                    error.kind(),
+                    format!(
+                        "--uring yes was asked for and this kernel would not give one: {error}"
+                    ),
+                )),
+            },
+        }
+    }
+
+    /// Whether this run serves on a ring, where there are no rings.
+    #[cfg(not(target_os = "linux"))]
+    fn uring(&self) -> io::Result<bool> {
+        match self.config.uring {
+            Uring::No | Uring::Auto => Ok(false),
+            Uring::Yes => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "--uring yes was asked for and io_uring is Linux only",
+            )),
+        }
     }
 }
 
@@ -219,8 +258,28 @@ struct Worker<'a> {
 }
 
 impl Worker<'_> {
-    /// Serve until something fails.
-    fn serve(&self) -> io::Result<()> {
+    /// Serve until something fails, on whichever loop the process chose.
+    fn serve(&self, uring: bool) -> io::Result<()> {
+        let env = Env {
+            map: self.map,
+            stats: self.stats,
+            thread: self.thread,
+            started: self.started,
+            config: self.config,
+        };
+
+        #[cfg(target_os = "linux")]
+        if uring {
+            return self.serve_uring(&env);
+        }
+        #[cfg(not(target_os = "linux"))]
+        debug_assert!(!uring, "there are no rings on this target");
+
+        self.serve_poller(&env)
+    }
+
+    /// Serve on a poller until something fails.
+    fn serve_poller(&self, env: &Env<'_>) -> io::Result<()> {
         let mut poller = Poller::new()?;
         for (at, listener) in self.listeners.iter().enumerate() {
             poller.add(
@@ -229,14 +288,6 @@ impl Worker<'_> {
                 Interest::READ,
             )?;
         }
-
-        let env = Env {
-            map: self.map,
-            stats: self.stats,
-            thread: self.thread,
-            started: self.started,
-            config: self.config,
-        };
 
         // Indexed by the token a connection was registered under, minus the listeners' share of the numbering. A vector with holes rather than a map, because a token is already an index and looking one up should not be a hash.
         let mut conns: Vec<Option<Conn>> = Vec::new();
@@ -266,7 +317,7 @@ impl Worker<'_> {
                 let turn = if event.gone {
                     Turn::Close
                 } else {
-                    conn.turn(&env, event.read, event.write)
+                    conn.turn(env, event.read, event.write)
                 };
                 match turn {
                     Turn::Read | Turn::Write => {
@@ -345,15 +396,23 @@ mod tests {
 
     use super::*;
 
+    /// A server on a port the operating system chose, serving on the poller.
+    ///
+    /// The loop is named rather than left at the default, because the default is whichever loop the machine can run and a test that answers a different question on Linux than it does on macOS is a test whose passing says less than it looks like it says.
+    fn serving(threads: usize) -> u16 {
+        serving_with(threads, Uring::No)
+    }
+
     /// A server on a port the operating system chose, and the port it chose.
     ///
     /// Left running for the rest of the process: there is no stop, because nothing in the serving path checks for one, and a test that wants a fresh server asks for another port rather than reclaiming this one.
-    fn serving(threads: usize) -> u16 {
+    fn serving_with(threads: usize, uring: Uring) -> u16 {
         let config = Config {
             threads,
             // Nought is a request for whichever port is free, which is what lets these tests run beside each other and beside anything else on the machine.
             port: Some(0),
             unixsocket: None,
+            uring,
             ..Config::default()
         };
         let server = Server::new(config).expect("the server bound");
@@ -458,6 +517,40 @@ mod tests {
             3,
         );
         assert_eq!(back, ["+OK\r\n", "$5\r\n", "world\r\n"]);
+    }
+
+    // The completion loop doing what the readiness loop does, on the shape that exercises the most of it: several threads, a burst of connections between them, and a key written through one and read through another.
+    //
+    // It skips rather than fails where there is no ring, because a container's seccomp profile has the last word on whether the syscall is allowed and a test that fails in one is a test somebody deletes.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_ring_serves_what_a_poller_serves() {
+        if !rugo_net::uring::Ring::available() {
+            return;
+        }
+        let port = serving_with(4, Uring::Yes);
+        for n in 0..32 {
+            let set = format!("*3\r\n$3\r\nSET\r\n$4\r\nk{n:03}\r\n$4\r\nv{n:03}\r\n");
+            assert_eq!(talk(port, set.as_bytes(), 1), ["+OK\r\n"]);
+        }
+        for n in 0..32 {
+            let get = format!("*2\r\n$3\r\nGET\r\n$4\r\nk{n:03}\r\n");
+            assert_eq!(
+                talk(port, get.as_bytes(), 2),
+                ["$4\r\n".to_owned(), format!("v{n:03}\r\n")],
+                "key k{n:03} did not come back from the ring"
+            );
+        }
+
+        // A pipeline in one write, which is what the sweep sends and what the loop answers with one send.
+        assert_eq!(
+            talk(
+                port,
+                b"*1\r\n$4\r\nPING\r\n*2\r\n$3\r\nGET\r\n$4\r\nk000\r\n*1\r\n$4\r\nPING\r\n",
+                4
+            ),
+            ["+PONG\r\n", "$4\r\n", "v000\r\n", "+PONG\r\n"]
+        );
     }
 
     #[test]

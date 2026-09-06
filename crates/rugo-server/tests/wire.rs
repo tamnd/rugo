@@ -18,7 +18,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
-use rugo_server::{Config, Server};
+use rugo_server::{Config, Server, Uring};
 
 /// How long a reply may take before the test decides there is not going to be one.
 ///
@@ -52,6 +52,12 @@ impl Drop for Client {
 ///
 /// One server a test rather than one shared between them, because `FLUSHALL` and `DBSIZE` are in the set and a shared map would make those two tests depend on the order the others ran in.
 fn talking() -> Client {
+    // The readiness loop rather than whichever loop this machine can run. Every test below is a claim about what the bytes on the wire are, which is not a claim about how they got there, and a suite that tested the ring on Linux and the poller everywhere else would be a suite whose passing depended on where it ran. The claim that the two are the same is one test, at the bottom of this file, and it is the only one here that needs a ring.
+    talking_on(Uring::No)
+}
+
+/// The same, on a named loop.
+fn talking_on(uring: Uring) -> Client {
     let path = std::env::temp_dir().join(format!(
         "rugo-wire-{}-{}.sock",
         std::process::id(),
@@ -64,7 +70,7 @@ fn talking() -> Client {
         maxmemory: MAXMEMORY,
         // Enough to be a sharded map and few enough that starting one a test costs nothing.
         shards: 64,
-        ..Config::default()
+        uring,
     };
     let server = Server::new(config).expect("the server bound");
     std::thread::spawn(move || {
@@ -496,4 +502,67 @@ fn a_command_this_server_does_not_have_is_an_error_rather_than_a_silence() {
     client.ask(&[&long], &format!("-ERR unknown command '{long}'\r\n"));
     // And the connection is still good afterwards, which is the part that matters.
     client.ask(&["PING"], "+PONG\r\n");
+}
+
+// The claim the second loop has to earn: the same bytes, in the same order, for the same requests.
+//
+// Everything above tests the readiness loop, because that is the one every machine can run. This is the only test that needs a ring, and it makes the comparison rather than restating the expectations, so it says the loops agree rather than that both agree with something written twice.
+//
+// It skips where there is no ring. A container's seccomp profile has the last word on whether the syscall is allowed, and a test that fails inside one is a test that gets deleted.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_ring_answers_what_the_poller_answers() {
+    if !rugo_net::uring::Ring::available() {
+        return;
+    }
+
+    // Larger than a socket buffer, so the reply takes more than one write and the loop has to come back for the rest of it.
+    let big = "v".repeat(256 * 1024);
+    let bulk = |value: &str| format!("${}\r\n{value}\r\n", value.len()).len();
+
+    // The request, and how long its reply is. The length is computed rather than the reply, because what is being compared here is the two servers against each other.
+    let script: Vec<(Vec<u8>, usize)> = vec![
+        (cmd(&["PING"]), "+PONG\r\n".len()),
+        (cmd(&["SET", "one", "1"]), "+OK\r\n".len()),
+        (cmd(&["INCRBY", "one", "41"]), ":42\r\n".len()),
+        (cmd(&["GET", "one"]), bulk("42")),
+        (cmd(&["GET", "missing"]), "$-1\r\n".len()),
+        (cmd(&["SET", "big", &big]), "+OK\r\n".len()),
+        (cmd(&["STRLEN", "big"]), format!(":{}\r\n", big.len()).len()),
+        (cmd(&["GET", "big"]), bulk(&big)),
+        // Three commands in one write, which is the shape the sweep sends and the one a completion loop answers with a single send.
+        (
+            [
+                cmd(&["GET", "one"]),
+                cmd(&["PING"]),
+                cmd(&["EXISTS", "big"]),
+            ]
+            .concat(),
+            bulk("42") + "+PONG\r\n".len() + ":1\r\n".len(),
+        ),
+        // An inline command, which parses down a different path from everything above it.
+        (b"PING\r\n".to_vec(), "+PONG\r\n".len()),
+    ];
+
+    let run = |uring: Uring| -> String {
+        let mut client = talking_on(uring);
+        let mut back = String::new();
+        for (request, len) in &script {
+            client.send(request);
+            back.push_str(&client.take(*len));
+        }
+        back
+    };
+
+    let poller = run(Uring::No);
+    let ring = run(Uring::Yes);
+
+    // Compared by hand rather than with `assert_eq`, whose failure message would be six megabytes of v.
+    let at = poller.bytes().zip(ring.bytes()).position(|(a, b)| a != b);
+    assert!(
+        at.is_none() && poller.len() == ring.len(),
+        "the loops disagree at byte {at:?}, over {} bytes from the poller and {} from the ring",
+        poller.len(),
+        ring.len()
+    );
 }

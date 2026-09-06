@@ -46,7 +46,7 @@ The short version: this is a cache, not a database. Everything about durability,
 
 **P3, three probe implementations rather than one.** NEON, SSE2 and a word-at-a-time fallback. The fallback is not a courtesy: it is what runs on any target without a vector unit, and it is tested on every push because the machine this was written on compiles exactly one of the three.
 
-**P4, no `io_uring` yet.** Pogocache has it and it is most of what it wins with at depth. `--uring` is accepted here and does nothing; the backend is a later milestone. Any throughput number published before then is a number measured without it, and the scoreboard says so rather than explaining it away.
+**P4, `io_uring` is here and is off unless it is asked for.** Pogocache has it and it is most of what it wins with at depth. There is a ring loop here too, in `rugo-server::uring`, and `--uring auto` or `--uring yes` is what runs it. The default is `no`, because which of the two loops is faster has not been measured on a box quiet enough to tell, and a default nobody has measured is not a default. Every throughput number published so far is a number measured on the poller, and the scoreboard says so rather than explaining it away.
 
 **P5, one protocol rather than three.** Pogocache speaks RESP, the memcache text protocol and HTTP. This speaks RESP. The other two are a later milestone and their absence is why `cache-bench` can drive this at all today.
 

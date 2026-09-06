@@ -39,12 +39,14 @@ Options:
   --threads <n>         serving threads (default: one per core)
   --shards <n>          map shards, rounded up to a power of two (default: 16 a thread)
   --maxmemory <size>    byte ceiling, as a number or with kb/mb/gb (default: none)
-  --uring <auto|yes|no> use io_uring where the kernel has it (default auto)
+  --uring <auto|yes|no> use io_uring where the kernel has it (default no)
   --version             print the version and exit
   --help                print this and exit
 ```
 
-`--uring` picks the serving loop on Linux. `auto` takes an io_uring loop where the kernel offers one and falls back to epoll where it does not, `yes` refuses to start where it cannot have one, and `no` keeps the poller. Everywhere else there is only the poller and `yes` is an error. The two loops answer the same bytes, which the wire tests check by running the same script through both, and which of them is faster here has not been measured yet.
+`--uring` picks the serving loop on Linux. `auto` takes an io_uring loop where the kernel offers one and falls back to epoll where it does not, `yes` refuses to start where it cannot have one, and `no` keeps the poller. Everywhere else there is only the poller and `yes` is an error. The two loops answer the same bytes, which the wire tests check by running the same script through both.
+
+The default is `no`, which is the poller, and that is a statement about evidence rather than about the ring. Every number published so far was taken on the poller, and the only comparisons run so far were on boxes with other people's work on them, where the two loops were a long way inside the noise. A default nobody has measured is not a default, so the ring is opt in until a quiet host says otherwise.
 
 ## The commands
 

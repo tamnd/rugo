@@ -8,6 +8,22 @@ The rule from the changelog holds here too. Any number carries the machine and t
 
 The shape almost everything below was measured on: `server3`, which is an eight core EPYC with a real PMU, one server thread, pipeline depth twenty five over a unix socket, five million keys of one to a thousand and twenty four bytes, every lookup hitting, counters restricted to user space, and the two binaries run in alternation rather than one after the other because the box is shared and its load moves over an hour.
 
+## The ring against the poller, on boxes that could not tell them apart
+
+Not a change and not thrown away. This is a measurement that failed to say anything, written down so the next attempt begins on a quiet host instead of on these three.
+
+The question is which of the two serving loops is faster, and the answer decides what `--uring` should default to. `cargo xtask load` was written for it: it drives a running server over a unix socket and reads the server's own processor time an operation out of `/proc`, which is the figure that survives a run where the load generator rather than the server is the thing in short supply.
+
+`server1` is four cores with about a core and a half of somebody else's work on it. First attempt: the server pinned to two cores with two threads, the generator pinned to the other two, four connections at pipeline depth twenty five, a million operations a run, two hundred thousand keys of a hundred bytes, one write in eleven, five rounds of `--uring no` against `--uring yes` alternated. The ring read higher processor time an operation in four rounds of the five, 2.88 microseconds against 1.86 at the median, which reads like an answer until the second attempt.
+
+Second attempt: one server thread on one core, the generator on another, eight rounds each of four binaries. The lowest processor time an operation over the eight was 0.74 for the poller and 0.99 for the ring, and the median was 1.37 against 1.51. The same direction, a fifth of the size, and in every row of both attempts the generator's own processor time an operation tracked the server's within a few per cent, which is what a run looks like when what it is measuring is the box rather than the program.
+
+The other hosts were worse. `server2` is six cores and ran a crawler at four hundred per cent of a core through the whole window. `server3` is the quiet eight core box and is most of a day into the sweep that produces the first published throughput numbers. `gpc` restarts every few minutes under load it does not control.
+
+Two of the four binaries in the second attempt were the pacing change in the changelog, the clock tick and the sweep moved off the turn and onto a millisecond, and they were inside the same noise. That one could not have shown there whatever the box was doing: this load sets no expiries, and a shard with nothing in it to expire is already skipped without being read, so the work the change removes is a lock and a counter rather than the walk it removes on a keyspace that does use TTLs.
+
+The lesson is about the harness rather than about either loop. Processor time an operation is the right metric and it is not enough on its own: a run only says something if the generator's share of it stays flat while the server's moves. Both attempts are worth about half an hour on `server3` once its sweep is done, and nothing at all before then.
+
 ## A batch of parsed commands rather than a batch of asked-for keys
 
 Never opened. The idea it was competing with landed instead, and this is the version of it that did not work.

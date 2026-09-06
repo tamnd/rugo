@@ -153,6 +153,17 @@ mod imp {
             })
         }
     }
+
+    /// Start fetching the cache line holding `at` into L1.
+    ///
+    /// `core::arch::aarch64::_prefetch` is not stable, so this is the instruction it would emit, written out. `pldl1keep` is a load into L1 with the line kept for reuse, which is what a slot about to be read wants.
+    #[inline]
+    pub(crate) fn prefetch(at: *const u8) {
+        // SAFETY: `prfm` is a hint. It never faults, never traps on an unmapped or misaligned address, and has no architectural effect other than on the cache, so any value of `at` is sound. `nostack` and `readonly` say the same thing to the compiler, and `at` is only read as an address.
+        unsafe {
+            core::arch::asm!("prfm pldl1keep, [{at}]", at = in(reg) at, options(nostack, readonly, preserves_flags));
+        }
+    }
 }
 
 #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
@@ -205,6 +216,13 @@ mod imp {
                 unsafe { sse::_mm_movemask_epi8(self.0) }.cast_unsigned(),
             ))
         }
+    }
+
+    /// Start fetching the cache line holding `at` into L1.
+    #[inline]
+    pub(crate) fn prefetch(at: *const u8) {
+        // SAFETY: `_mm_prefetch` is a hint. It reads nothing and faults on nothing, so any address is sound to pass it, and it is unconditionally available under target_feature = "sse2".
+        unsafe { sse::_mm_prefetch::<{ sse::_MM_HINT_T0 }>(at.cast()) }
     }
 }
 
@@ -260,9 +278,17 @@ mod imp {
             BitMask(self.0 & HIGHS)
         }
     }
+
+    /// Start fetching the cache line holding `at` into L1, on a target where there is no portable way to ask.
+    ///
+    /// Nothing happens. The caller loads the address a few instructions later either way, so a target without a prefetch hint gets the same answer more slowly rather than a different answer.
+    #[inline]
+    pub(crate) fn prefetch(at: *const u8) {
+        let _ = at;
+    }
 }
 
-pub(crate) use imp::{Group, WIDTH};
+pub(crate) use imp::{Group, WIDTH, prefetch};
 
 #[cfg(test)]
 mod tests {

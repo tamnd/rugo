@@ -11,7 +11,7 @@
 //! Groups are aligned, so a group never straddles the end of the control array and the array needs no mirrored tail. The sequence over groups is triangular, stepping by one group then two then three, which visits every group exactly once when the count is a power of two. A probe therefore either finds the key or reaches an empty slot, and it cannot run forever while the load factor is under one.
 
 use crate::entry::{self, Head, View};
-use crate::group::{DELETED, EMPTY, Group, WIDTH, is_full, tag_of};
+use crate::group::{DELETED, EMPTY, Group, WIDTH, is_full, prefetch, tag_of};
 use rugo_arena::{Arena, Full, Ref};
 
 /// The smallest table, in slots.
@@ -196,6 +196,10 @@ impl Table {
 
         loop {
             let base = group * WIDTH;
+            // The two loads this group needs are in unrelated allocations and at ten million keys both of them miss, but only the first can start on its own: the lane a slot is read from comes out of the tag comparison, so the slot load cannot issue until the control bytes have arrived. Asking for the slots here rather than waiting to be told which one costs a hint and lets the second miss run underneath the first, which turns three chained misses on the way to a key into two.
+            //
+            // The whole group of slots is asked for at once, at `base`, because the address is known before the lane is. Sixteen slots are sixteen four byte references, so the group is a cache line, and any lane that matches is in the line the hint asked for or the one after it.
+            prefetch(self.slots.as_ptr().wrapping_add(base).cast());
             let probe = self.group_at(base);
             for lane in probe.match_byte(tag) {
                 let at = base + lane;
@@ -548,7 +552,7 @@ impl Table {
     ///
     /// Returns where to resume and how many went. Bounded rather than exhaustive so a caller can sweep a large shard in pieces without holding its lock for the whole of it, which is the difference between a background sweep and a stall.
     pub fn sweep(&mut self, from: usize, budget: usize, now: u32) -> (usize, usize) {
-        // Nothing in this shard was given a TTL, so there is nothing here that can have expired. The walk below would read the header of every full slot it passed to be told so one entry at a time, and those headers are at unrelated offsets in the arena, so the reading is what the call costs rather than the walking. Measured on `server3`, one thread, pipeline depth twenty-five over a unix socket against a map of ten million keys none of which had an expiry, the whole call was worth about two hundred and fifty cycles per operation out of five thousand eight hundred.
+        // Nothing in this shard was given a TTL, so there is nothing here that can have expired. The walk below would read the header of every full slot it passed to be told so one entry at a time, and those headers are at unrelated offsets in the arena, so the reading is what the call costs rather than the walking. Measured on `server3` with user space counters, one thread, pipeline depth twenty-five over a unix socket, five million keys of one to a thousand bytes none of which had an expiry and every lookup hitting, the walk is eighteen instructions per operation out of twelve hundred. What that is worth in cycles is inside the spread of that box and no figure is claimed for it.
         //
         // The position is returned unmoved. There was nothing to find here, so resuming where this left off loses nothing, and advancing it would mean a shard that later gains a TTL starts its first real sweep partway through.
         if self.timed == 0 {

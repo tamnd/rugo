@@ -94,7 +94,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2.9.2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - uses: taiki-e/install-action@v2.87.4
+      - uses: taiki-e/install-action@v2.87.15
         with:
           tool: cargo-nextest
       - run: cargo nextest run ${{ matrix.scope }} --locked
@@ -212,4 +212,4 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v7.0.1
-      - uses: crate-ci/typos@v1.50.1
+      - uses: crate-ci/typos@v1.50.2

@@ -164,7 +164,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@nightly
         with:
           components: miri
-      - uses: taiki-e/install-action@v2.87.4
+      - uses: taiki-e/install-action@v2.87.27
         with:
           tool: cargo-nextest
       - uses: Swatinem/rust-cache@v2.9.2
@@ -239,7 +239,7 @@ jobs:
         with:
           ref: ${{ needs.wanted.outputs.ref }}
       - uses: dtolnay/rust-toolchain@nightly
-      - uses: taiki-e/install-action@v2.87.4
+      - uses: taiki-e/install-action@v2.87.27
         with:
           tool: cargo-fuzz
       - uses: Swatinem/rust-cache@v2.9.2
@@ -266,7 +266,7 @@ jobs:
           rc=0
           for p in $pids; do wait "$p" || rc=1; done
           exit $rc
-      - uses: actions/upload-artifact@v7.0.1
+      - uses: actions/upload-artifact@v7.0.2
         if: failure()
         with:
           name: fuzz-artifacts

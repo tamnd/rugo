@@ -164,10 +164,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@nightly
         with:
           components: miri
-      - uses: taiki-e/install-action@v2.87.4
+      - uses: taiki-e/install-action@v2.87.31
         with:
           tool: cargo-nextest
-      - uses: Swatinem/rust-cache@v2.9.2
+      - uses: Swatinem/rust-cache@v2.9.3
         with:
           # Every shard builds a different subset of the tree with the same nightly, so without a key of its own they would race for one cache entry and each keep evicting the others'.
           key: ${{ matrix.borrows }}-${{ matrix.crate }}
@@ -213,7 +213,7 @@ jobs:
         with:
           ref: ${{ needs.wanted.outputs.ref }}
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2.9.2
+      - uses: Swatinem/rust-cache@v2.9.3
         with:
           key: loom
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -239,10 +239,10 @@ jobs:
         with:
           ref: ${{ needs.wanted.outputs.ref }}
       - uses: dtolnay/rust-toolchain@nightly
-      - uses: taiki-e/install-action@v2.87.4
+      - uses: taiki-e/install-action@v2.87.31
         with:
           tool: cargo-fuzz
-      - uses: Swatinem/rust-cache@v2.9.2
+      - uses: Swatinem/rust-cache@v2.9.3
         with:
           key: fuzz
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -266,7 +266,7 @@ jobs:
           rc=0
           for p in $pids; do wait "$p" || rc=1; done
           exit $rc
-      - uses: actions/upload-artifact@v7.0.1
+      - uses: actions/upload-artifact@v7.0.2
         if: failure()
         with:
           name: fuzz-artifacts
@@ -297,7 +297,7 @@ jobs:
         with:
           ref: ${{ needs.wanted.outputs.ref }}
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2.9.2
+      - uses: Swatinem/rust-cache@v2.9.3
       - run: cargo test ${{ matrix.scope }} --locked --release
 
   # The benchmarks have to keep compiling and keep running.
@@ -312,7 +312,7 @@ jobs:
         with:
           ref: ${{ needs.wanted.outputs.ref }}
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2.9.2
+      - uses: Swatinem/rust-cache@v2.9.3
       # Fat link time optimisation, one codegen unit and debug info are what the bench profile owes the numbers on a bench host.
       # This job produces no numbers, so it owes them nothing and pays several minutes for them.
       - run: cargo bench --workspace --locked -- --test
